@@ -10,11 +10,12 @@ local WHISPER = "/opt/homebrew/bin/whisper-cli"
 
 local DOUBLE_TAP_WINDOW = 0.4  -- seconds: second fn-down within this = double tap
 
-local recording        = false
-local toggleMode       = false  -- true when recording is "locked on" via double-tap
-local recordingTask    = nil
-local releaseWatchdog  = nil
-local lastFnDownTime   = 0
+local recording             = false
+local toggleMode            = false  -- true when recording is "locked on" via double-tap
+local recordingTask         = nil
+local releaseWatchdog       = nil
+local pendingTranscribeTimer = nil   -- the doAfter(0.3) handle, so double-tap can cancel it
+local lastFnDownTime        = 0
 
 -- ─── Indicator anchor (top-right of screen, just below menubar) ──────────────
 local INDICATOR_SIZE   = 22
@@ -31,7 +32,7 @@ local function indicatorFrame()
   }
 end
 
--- ─── Recording indicator (pulsing red dot; solid when locked) ────────────────
+-- ─── Recording indicator (pulsing red dot; solid with white ring when locked)
 local recIndicator  = nil
 local recPulseTimer = nil
 
@@ -49,7 +50,6 @@ local function showRecordingIndicator(locked)
     radius    = INDICATOR_SIZE / 2 - 3,
     center    = {x = INDICATOR_SIZE / 2, y = INDICATOR_SIZE / 2},
   }
-  -- Locked mode: thin white ring around the dot to differentiate
   if locked then
     recIndicator[2] = {
       type        = "circle",
@@ -62,7 +62,6 @@ local function showRecordingIndicator(locked)
   end
   recIndicator:show()
 
-  -- Pulse only when NOT locked (locked = solid steady)
   if not locked then
     local t0 = hs.timer.secondsSinceEpoch()
     recPulseTimer = hs.timer.doEvery(0.04, function()
@@ -79,7 +78,7 @@ local function hideRecordingIndicator()
   if recIndicator then recIndicator:delete(); recIndicator = nil end
 end
 
--- ─── Transcribing indicator (pulsing pen at same anchor) ─────────────────────
+-- ─── Transcribing indicator (pulsing pen) ────────────────────────────────────
 local transIndicator  = nil
 local transPulseTimer = nil
 
@@ -128,6 +127,16 @@ local function transcribeAndPaste(wavPath)
   task:start()
 end
 
+-- Cancel a pending transcribe (called when a double-tap arrives mid-cooldown)
+local function cancelPendingTranscribe()
+  if pendingTranscribeTimer then
+    pendingTranscribeTimer:stop()
+    pendingTranscribeTimer = nil
+  end
+  hideTranscribingIndicator()
+  os.remove(WAV)  -- discard the orphaned tiny recording
+end
+
 -- ─── Recording lifecycle ─────────────────────────────────────────────────────
 local function stopRec()
   if not recording then return end
@@ -142,16 +151,18 @@ local function stopRec()
   showTranscribingIndicator()
 
   local snapshotPath = "/tmp/upscale-talk-" .. os.time() .. "-" .. math.random(1000, 9999) .. ".wav"
-  hs.timer.doAfter(0.3, function()
+  pendingTranscribeTimer = hs.timer.doAfter(0.3, function()
+    pendingTranscribeTimer = nil
     os.execute(string.format("mv %q %q 2>/dev/null", WAV, snapshotPath))
     transcribeAndPaste(snapshotPath)
     hs.timer.doAfter(10, function() os.remove(snapshotPath) end)
   end)
 end
 
-local function startRec()
+local function startRec(asToggle)
   if recording then return end
   recording = true
+  toggleMode = asToggle and true or false
   os.remove(WAV)
 
   local dev = hs.audiodevice.defaultInputDevice()
@@ -162,28 +173,28 @@ local function startRec()
      "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "-y", WAV})
   recordingTask:start()
 
-  showRecordingIndicator(false)  -- start in hold mode (pulsing)
+  showRecordingIndicator(toggleMode)
 
-  -- Watchdog for release detection (hold-to-talk mode). Cancelled when we
-  -- transition to toggle mode via a double-tap.
-  releaseWatchdog = hs.timer.doEvery(0.03, function()
-    if toggleMode then return end  -- in toggle mode, ignore release
-    local mods = hs.eventtap.checkKeyboardModifiers()
-    if not mods.fn then
-      stopRec()
-    end
-  end)
+  -- Watchdog only runs in hold mode; toggle mode ignores fn-release
+  if not toggleMode then
+    releaseWatchdog = hs.timer.doEvery(0.03, function()
+      if toggleMode then return end
+      local mods = hs.eventtap.checkKeyboardModifiers()
+      if not mods.fn then
+        stopRec()
+      end
+    end)
+  end
 end
 
-local function enterToggleMode()
+-- Convert an in-flight hold recording into a locked toggle recording
+local function promoteToToggle()
   toggleMode = true
-  -- Cancel the release watchdog so fn-release no longer stops us
   if releaseWatchdog then releaseWatchdog:stop(); releaseWatchdog = nil end
-  -- Swap the indicator: solid red with a white ring = "locked on"
   showRecordingIndicator(true)
 end
 
--- ─── fn-key event tap (DOWN edge) ────────────────────────────────────────────
+-- ─── fn-key event tap ────────────────────────────────────────────────────────
 local fnTap
 fnTap = hs.eventtap.new({
   hs.eventtap.event.types.flagsChanged,
@@ -197,29 +208,35 @@ fnTap = hs.eventtap.new({
     return false
   end
 
-  -- Only react to fn-DOWN edge
-  if not event:getFlags().fn then return false end
+  if not event:getFlags().fn then return false end  -- ignore fn-UP events here
 
   local now = hs.timer.secondsSinceEpoch()
   local sinceLast = now - lastFnDownTime
   lastFnDownTime = now
 
+  -- Currently locked in toggle mode? Any fn-tap stops it.
   if toggleMode then
-    -- We're recording in toggle mode; this fn-tap stops the recording
     stopRec()
     return false
   end
 
-  if recording and sinceLast < DOUBLE_TAP_WINDOW then
-    -- We were hold-recording, this is the second tap of a double-tap →
-    -- promote to toggle (locked) mode so user can release fn and keep recording
-    enterToggleMode()
+  -- Double-tap detection: second fn-down within DOUBLE_TAP_WINDOW
+  if sinceLast < DOUBLE_TAP_WINDOW then
+    -- Cancel any pending transcribe from the first tap's release
+    cancelPendingTranscribe()
+    if recording then
+      -- Still hold-recording → just promote to locked
+      promoteToToggle()
+    else
+      -- Watchdog beat us; start fresh in locked mode
+      startRec(true)
+    end
     return false
   end
 
+  -- Normal first tap-and-hold
   if not recording then
-    -- Normal first tap-and-hold (also covers the first tap of a future double-tap)
-    startRec()
+    startRec(false)
   end
   return false
 end)
