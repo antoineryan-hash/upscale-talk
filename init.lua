@@ -11,6 +11,23 @@ local recording = false
 local recordingTask = nil
 local releaseWatchdog = nil
 
+-- Async transcribe + paste. Runs on a background queue so the main thread
+-- stays responsive to new fn-presses while a prior transcription is in flight.
+local function transcribeAndPaste(wavPath)
+  local task = hs.task.new(WHISPER, function(exitCode, stdOut, _stdErr)
+    if exitCode ~= 0 then return end
+    local text = (stdOut or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if #text == 0 then return end
+    local prev = hs.pasteboard.getContents()
+    hs.pasteboard.setContents(text)
+    hs.osascript.applescript([[tell application "System Events" to keystroke "v" using command down]])
+    hs.timer.doAfter(0.5, function()
+      if prev then hs.pasteboard.setContents(prev) end
+    end)
+  end, {"-m", MODEL, "-f", wavPath, "-nt", "-np"})
+  task:start()
+end
+
 local function stopRec()
   if not recording then return end
   recording = false
@@ -21,19 +38,15 @@ local function stopRec()
   end
   hs.alert.show("⏳", 0.3)
 
-  -- Give ffmpeg ~0.3s to finalise the WAV header
+  -- Snapshot the WAV path NOW so a fast new recording doesn't overwrite the
+  -- file we're about to transcribe before whisper-cli reads it.
+  local snapshotPath = "/tmp/upscale-talk-" .. os.time() .. "-" .. math.random(1000, 9999) .. ".wav"
   hs.timer.doAfter(0.3, function()
-    local cmd = string.format("%s -m %q -f %q -nt -np 2>/dev/null", WHISPER, MODEL, WAV)
-    local out = hs.execute(cmd)
-    local text = (out or ""):gsub("^%s+", ""):gsub("%s+$", "")
-    if #text > 0 then
-      local prev = hs.pasteboard.getContents()
-      hs.pasteboard.setContents(text)
-      hs.osascript.applescript([[tell application "System Events" to keystroke "v" using command down]])
-      hs.timer.doAfter(0.5, function()
-        if prev then hs.pasteboard.setContents(prev) end
-      end)
-    end
+    -- Move (not copy) so we don't waste disk on duplicates
+    os.execute(string.format("mv %q %q 2>/dev/null", WAV, snapshotPath))
+    transcribeAndPaste(snapshotPath)
+    -- Clean up the snapshot ~10s later
+    hs.timer.doAfter(10, function() os.remove(snapshotPath) end)
   end)
 end
 
@@ -66,8 +79,20 @@ local function startRec()
 end
 
 -- fn key (Globe) listener for the DOWN edge via flagsChanged event tap.
--- We don't rely on this for the UP edge — see releaseWatchdog in startRec().
-local fnTap = hs.eventtap.new({hs.eventtap.event.types.flagsChanged}, function(event)
+-- Also handle tap-disabled events so a transient timeout doesn't permanently
+-- kill the binding.
+local fnTap
+fnTap = hs.eventtap.new({
+  hs.eventtap.event.types.flagsChanged,
+  hs.eventtap.event.types.tapDisabledByTimeout,
+  hs.eventtap.event.types.tapDisabledByUserInput,
+}, function(event)
+  local etype = event:getType()
+  if etype == hs.eventtap.event.types.tapDisabledByTimeout
+     or etype == hs.eventtap.event.types.tapDisabledByUserInput then
+    fnTap:start()  -- re-enable on transient kill
+    return false
+  end
   if event:getFlags().fn and not recording then
     startRec()
   end
