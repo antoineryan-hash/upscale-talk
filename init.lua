@@ -1,4 +1,5 @@
 -- upscale-talk: hold fn → speak → release → text pastes at cursor
+-- Double-tap fn → toggle "locked" recording (hands-free); tap fn again to stop.
 -- Free, local-only Whisper push-to-talk dictation for macOS.
 -- https://github.com/antoineryan-hash/upscale-talk
 
@@ -7,9 +8,13 @@ local MODEL   = os.getenv("HOME") .. "/.upscale-talk/models/ggml-large-v3-turbo-
 local FFMPEG  = "/opt/homebrew/bin/ffmpeg"
 local WHISPER = "/opt/homebrew/bin/whisper-cli"
 
-local recording = false
-local recordingTask = nil
-local releaseWatchdog = nil
+local DOUBLE_TAP_WINDOW = 0.4  -- seconds: second fn-down within this = double tap
+
+local recording        = false
+local toggleMode       = false  -- true when recording is "locked on" via double-tap
+local recordingTask    = nil
+local releaseWatchdog  = nil
+local lastFnDownTime   = 0
 
 -- ─── Indicator anchor (top-right of screen, just below menubar) ──────────────
 local INDICATOR_SIZE   = 22
@@ -26,12 +31,14 @@ local function indicatorFrame()
   }
 end
 
--- ─── Recording indicator (pulsing red dot) ───────────────────────────────────
-local recIndicator = nil
+-- ─── Recording indicator (pulsing red dot; solid when locked) ────────────────
+local recIndicator  = nil
 local recPulseTimer = nil
 
-local function showRecordingIndicator()
-  if recIndicator then return end
+local function showRecordingIndicator(locked)
+  if recIndicator then recIndicator:delete() end
+  if recPulseTimer then recPulseTimer:stop(); recPulseTimer = nil end
+
   recIndicator = hs.canvas.new(indicatorFrame())
   recIndicator:level(hs.canvas.windowLevels.overlay)
   recIndicator:behavior({"canJoinAllSpaces", "stationary"})
@@ -42,16 +49,29 @@ local function showRecordingIndicator()
     radius    = INDICATOR_SIZE / 2 - 3,
     center    = {x = INDICATOR_SIZE / 2, y = INDICATOR_SIZE / 2},
   }
+  -- Locked mode: thin white ring around the dot to differentiate
+  if locked then
+    recIndicator[2] = {
+      type        = "circle",
+      action      = "stroke",
+      strokeColor = {white = 1, alpha = 0.9},
+      strokeWidth = 1.5,
+      radius      = INDICATOR_SIZE / 2 - 1,
+      center      = {x = INDICATOR_SIZE / 2, y = INDICATOR_SIZE / 2},
+    }
+  end
   recIndicator:show()
 
-  local t0 = hs.timer.secondsSinceEpoch()
-  recPulseTimer = hs.timer.doEvery(0.04, function()
-    if not recIndicator then return end
-    local elapsed = hs.timer.secondsSinceEpoch() - t0
-    -- Sine pulse, alpha 0.35 → 1.0, 1.2-second cycle
-    local alpha = 0.35 + 0.65 * (0.5 + 0.5 * math.sin(elapsed * math.pi * 2 / 1.2))
-    recIndicator[1].fillColor = {red = 1, green = 0.15, blue = 0.15, alpha = alpha}
-  end)
+  -- Pulse only when NOT locked (locked = solid steady)
+  if not locked then
+    local t0 = hs.timer.secondsSinceEpoch()
+    recPulseTimer = hs.timer.doEvery(0.04, function()
+      if not recIndicator then return end
+      local elapsed = hs.timer.secondsSinceEpoch() - t0
+      local alpha = 0.35 + 0.65 * (0.5 + 0.5 * math.sin(elapsed * math.pi * 2 / 1.2))
+      recIndicator[1].fillColor = {red = 1, green = 0.15, blue = 0.15, alpha = alpha}
+    end)
+  end
 end
 
 local function hideRecordingIndicator()
@@ -59,8 +79,8 @@ local function hideRecordingIndicator()
   if recIndicator then recIndicator:delete(); recIndicator = nil end
 end
 
--- ─── Transcribing indicator (pulsing pen ✍️ at same anchor) ──────────────────
-local transIndicator = nil
+-- ─── Transcribing indicator (pulsing pen at same anchor) ─────────────────────
+local transIndicator  = nil
 local transPulseTimer = nil
 
 local function showTranscribingIndicator()
@@ -81,7 +101,6 @@ local function showTranscribingIndicator()
   transPulseTimer = hs.timer.doEvery(0.04, function()
     if not transIndicator then return end
     local elapsed = hs.timer.secondsSinceEpoch() - t0
-    -- Faster pulse (0.7-second cycle) signals "working hard"; alpha 0.45 → 1.0
     local alpha = 0.45 + 0.55 * (0.5 + 0.5 * math.sin(elapsed * math.pi * 2 / 0.7))
     transIndicator:alpha(alpha)
   end)
@@ -95,7 +114,7 @@ end
 -- ─── Async transcribe + paste ────────────────────────────────────────────────
 local function transcribeAndPaste(wavPath)
   local task = hs.task.new(WHISPER, function(exitCode, stdOut, _stdErr)
-    hideTranscribingIndicator()  -- always hide, even on failure
+    hideTranscribingIndicator()
     if exitCode ~= 0 then return end
     local text = (stdOut or ""):gsub("^%s+", ""):gsub("%s+$", "")
     if #text == 0 then return end
@@ -113,6 +132,7 @@ end
 local function stopRec()
   if not recording then return end
   recording = false
+  toggleMode = false
   if releaseWatchdog then releaseWatchdog:stop(); releaseWatchdog = nil end
   if recordingTask then
     recordingTask:terminate()
@@ -121,7 +141,6 @@ local function stopRec()
   hideRecordingIndicator()
   showTranscribingIndicator()
 
-  -- Snapshot the WAV so a fast new recording doesn't overwrite mid-transcribe
   local snapshotPath = "/tmp/upscale-talk-" .. os.time() .. "-" .. math.random(1000, 9999) .. ".wav"
   hs.timer.doAfter(0.3, function()
     os.execute(string.format("mv %q %q 2>/dev/null", WAV, snapshotPath))
@@ -135,8 +154,6 @@ local function startRec()
   recording = true
   os.remove(WAV)
 
-  -- Query the system's current default input device by NAME (avoids virtual
-  -- loopback devices like LoomAudioDevice that may sit at lower indices).
   local dev = hs.audiodevice.defaultInputDevice()
   local devName = dev and dev:name() or "MacBook Pro Microphone"
 
@@ -145,11 +162,12 @@ local function startRec()
      "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "-y", WAV})
   recordingTask:start()
 
-  showRecordingIndicator()
+  showRecordingIndicator(false)  -- start in hold mode (pulsing)
 
-  -- macOS 26+ sometimes swallows the fn-UP flagsChanged event before our
-  -- tap sees it. Poll every 30 ms for fn-state to detect release reliably.
+  -- Watchdog for release detection (hold-to-talk mode). Cancelled when we
+  -- transition to toggle mode via a double-tap.
   releaseWatchdog = hs.timer.doEvery(0.03, function()
+    if toggleMode then return end  -- in toggle mode, ignore release
     local mods = hs.eventtap.checkKeyboardModifiers()
     if not mods.fn then
       stopRec()
@@ -157,7 +175,15 @@ local function startRec()
   end)
 end
 
--- ─── fn-key event tap (DOWN edge only; release handled by watchdog) ─────────
+local function enterToggleMode()
+  toggleMode = true
+  -- Cancel the release watchdog so fn-release no longer stops us
+  if releaseWatchdog then releaseWatchdog:stop(); releaseWatchdog = nil end
+  -- Swap the indicator: solid red with a white ring = "locked on"
+  showRecordingIndicator(true)
+end
+
+-- ─── fn-key event tap (DOWN edge) ────────────────────────────────────────────
 local fnTap
 fnTap = hs.eventtap.new({
   hs.eventtap.event.types.flagsChanged,
@@ -170,11 +196,33 @@ fnTap = hs.eventtap.new({
     fnTap:start()
     return false
   end
-  if event:getFlags().fn and not recording then
+
+  -- Only react to fn-DOWN edge
+  if not event:getFlags().fn then return false end
+
+  local now = hs.timer.secondsSinceEpoch()
+  local sinceLast = now - lastFnDownTime
+  lastFnDownTime = now
+
+  if toggleMode then
+    -- We're recording in toggle mode; this fn-tap stops the recording
+    stopRec()
+    return false
+  end
+
+  if recording and sinceLast < DOUBLE_TAP_WINDOW then
+    -- We were hold-recording, this is the second tap of a double-tap →
+    -- promote to toggle (locked) mode so user can release fn and keep recording
+    enterToggleMode()
+    return false
+  end
+
+  if not recording then
+    -- Normal first tap-and-hold (also covers the first tap of a future double-tap)
     startRec()
   end
   return false
 end)
 fnTap:start()
 
-hs.alert.show("upscale-talk ready — hold fn to dictate", 1.5)
+hs.alert.show("upscale-talk ready — hold fn to dictate, double-tap fn to lock on", 2.0)
