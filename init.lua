@@ -11,8 +11,45 @@ local recording = false
 local recordingTask = nil
 local releaseWatchdog = nil
 
--- Async transcribe + paste. Runs on a background queue so the main thread
--- stays responsive to new fn-presses while a prior transcription is in flight.
+-- ─── Recording indicator (pulsing red dot, top-right of screen) ──────────────
+local indicator = nil
+local pulseTimer = nil
+
+local function showRecordingIndicator()
+  if indicator then return end
+  local sf = hs.screen.mainScreen():fullFrame()
+  local SIZE   = 18
+  local MARGIN = 26
+  local x = sf.x + sf.w - SIZE - MARGIN
+  local y = sf.y + 38  -- just below menubar
+  indicator = hs.canvas.new({x = x, y = y, w = SIZE, h = SIZE})
+  indicator:level(hs.canvas.windowLevels.overlay)
+  indicator:behavior({"canJoinAllSpaces", "stationary"})
+  indicator[1] = {
+    type        = "circle",
+    action      = "fill",
+    fillColor   = {red = 1, green = 0.15, blue = 0.15, alpha = 1.0},
+    radius      = SIZE / 2 - 2,
+    center      = {x = SIZE / 2, y = SIZE / 2},
+  }
+  indicator:show()
+
+  -- Pulse alpha between 0.35 and 1.0 over a ~1.2-second cycle (sine wave)
+  local t0 = hs.timer.secondsSinceEpoch()
+  pulseTimer = hs.timer.doEvery(0.04, function()
+    if not indicator then return end
+    local elapsed = hs.timer.secondsSinceEpoch() - t0
+    local alpha = 0.35 + 0.65 * (0.5 + 0.5 * math.sin(elapsed * math.pi * 2 / 1.2))
+    indicator[1].fillColor = {red = 1, green = 0.15, blue = 0.15, alpha = alpha}
+  end)
+end
+
+local function hideRecordingIndicator()
+  if pulseTimer then pulseTimer:stop(); pulseTimer = nil end
+  if indicator then indicator:delete(); indicator = nil end
+end
+
+-- ─── Async transcribe + paste ────────────────────────────────────────────────
 local function transcribeAndPaste(wavPath)
   local task = hs.task.new(WHISPER, function(exitCode, stdOut, _stdErr)
     if exitCode ~= 0 then return end
@@ -28,6 +65,7 @@ local function transcribeAndPaste(wavPath)
   task:start()
 end
 
+-- ─── Recording lifecycle ─────────────────────────────────────────────────────
 local function stopRec()
   if not recording then return end
   recording = false
@@ -36,16 +74,14 @@ local function stopRec()
     recordingTask:terminate()
     recordingTask = nil
   end
+  hideRecordingIndicator()
   hs.alert.show("⏳", 0.3)
 
-  -- Snapshot the WAV path NOW so a fast new recording doesn't overwrite the
-  -- file we're about to transcribe before whisper-cli reads it.
+  -- Snapshot the WAV so a fast new recording doesn't overwrite mid-transcribe
   local snapshotPath = "/tmp/upscale-talk-" .. os.time() .. "-" .. math.random(1000, 9999) .. ".wav"
   hs.timer.doAfter(0.3, function()
-    -- Move (not copy) so we don't waste disk on duplicates
     os.execute(string.format("mv %q %q 2>/dev/null", WAV, snapshotPath))
     transcribeAndPaste(snapshotPath)
-    -- Clean up the snapshot ~10s later
     hs.timer.doAfter(10, function() os.remove(snapshotPath) end)
   end)
 end
@@ -55,9 +91,8 @@ local function startRec()
   recording = true
   os.remove(WAV)
 
-  -- Query the system's current default input device by NAME so we don't
-  -- accidentally record from a virtual loopback (e.g. Loom, BlackHole) that
-  -- happens to have a lower device index than the real mic.
+  -- Query the system's current default input device by NAME (avoids virtual
+  -- loopback devices like LoomAudioDevice that may sit at lower indices).
   local dev = hs.audiodevice.defaultInputDevice()
   local devName = dev and dev:name() or "MacBook Pro Microphone"
 
@@ -65,11 +100,11 @@ local function startRec()
     {"-f", "avfoundation", "-i", ":" .. devName,
      "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "-y", WAV})
   recordingTask:start()
-  hs.alert.show("🎤", 0.3)
 
-  -- On macOS 26+, the fn-UP flagsChanged event is sometimes swallowed by
-  -- the system before reaching our event tap. Poll every 30ms while we're
-  -- recording to catch the release reliably.
+  showRecordingIndicator()
+
+  -- macOS 26+ sometimes swallows the fn-UP flagsChanged event before our
+  -- tap sees it. Poll every 30 ms for fn-state to detect release reliably.
   releaseWatchdog = hs.timer.doEvery(0.03, function()
     local mods = hs.eventtap.checkKeyboardModifiers()
     if not mods.fn then
@@ -78,9 +113,7 @@ local function startRec()
   end)
 end
 
--- fn key (Globe) listener for the DOWN edge via flagsChanged event tap.
--- Also handle tap-disabled events so a transient timeout doesn't permanently
--- kill the binding.
+-- ─── fn-key event tap (DOWN edge only; release handled by watchdog) ─────────
 local fnTap
 fnTap = hs.eventtap.new({
   hs.eventtap.event.types.flagsChanged,
@@ -90,7 +123,7 @@ fnTap = hs.eventtap.new({
   local etype = event:getType()
   if etype == hs.eventtap.event.types.tapDisabledByTimeout
      or etype == hs.eventtap.event.types.tapDisabledByUserInput then
-    fnTap:start()  -- re-enable on transient kill
+    fnTap:start()
     return false
   end
   if event:getFlags().fn and not recording then
