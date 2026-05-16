@@ -8,14 +8,14 @@ local MODEL   = os.getenv("HOME") .. "/.upscale-talk/models/ggml-large-v3-turbo-
 local FFMPEG  = "/opt/homebrew/bin/ffmpeg"
 local WHISPER = "/opt/homebrew/bin/whisper-cli"
 
-local DOUBLE_TAP_WINDOW = 0.4  -- seconds: second fn-down within this = double tap
+local DOUBLE_TAP_WINDOW = 0.4
 
-local recording             = false
-local toggleMode            = false  -- true when recording is "locked on" via double-tap
-local recordingTask         = nil
-local releaseWatchdog       = nil
-local pendingTranscribeTimer = nil   -- the doAfter(0.3) handle, so double-tap can cancel it
-local lastFnDownTime        = 0
+local recording              = false
+local toggleMode             = false
+local recordingTask          = nil
+local releaseWatchdog        = nil
+local pendingTranscribeTimer = nil
+local lastFnDownTime         = 0
 
 -- ─── Indicator anchor (top-right of screen, just below menubar) ──────────────
 local INDICATOR_SIZE   = 22
@@ -32,7 +32,20 @@ local function indicatorFrame()
   }
 end
 
--- ─── Recording indicator (pulsing red dot; solid with white ring when locked)
+-- Color palette
+local RED   = {red = 1.00, green = 0.15, blue = 0.15}
+local GREEN = {red = 0.20, green = 0.85, blue = 0.30}
+local WHITE = {white = 1.0}
+
+-- Build a sine-wave pulse value in [lo, hi] for the given period
+local function pulseAlpha(t0, period, lo, hi)
+  local elapsed = hs.timer.secondsSinceEpoch() - t0
+  return lo + (hi - lo) * (0.5 + 0.5 * math.sin(elapsed * math.pi * 2 / period))
+end
+
+-- ─── Recording indicator ─────────────────────────────────────────────────────
+-- Hold mode:   pulsing red dot
+-- Locked mode: solid white circle background + pulsing red dot inside
 local recIndicator  = nil
 local recPulseTimer = nil
 
@@ -43,34 +56,44 @@ local function showRecordingIndicator(locked)
   recIndicator = hs.canvas.new(indicatorFrame())
   recIndicator:level(hs.canvas.windowLevels.overlay)
   recIndicator:behavior({"canJoinAllSpaces", "stationary"})
-  recIndicator[1] = {
+
+  local center = {x = INDICATOR_SIZE / 2, y = INDICATOR_SIZE / 2}
+  local outerR = INDICATOR_SIZE / 2 - 2  -- ~9
+  local innerR = locked and (INDICATOR_SIZE / 2 - 6) or outerR  -- ~5 inside, or full
+  local layerIdx = 1
+
+  if locked then
+    -- Solid white circle as the steady "locked" frame
+    recIndicator[layerIdx] = {
+      type      = "circle",
+      action    = "fill",
+      fillColor = {white = 1.0, alpha = 1.0},
+      radius    = outerR,
+      center    = center,
+    }
+    layerIdx = layerIdx + 1
+  end
+
+  -- Red dot (the part that pulses)
+  recIndicator[layerIdx] = {
     type      = "circle",
     action    = "fill",
-    fillColor = {red = 1, green = 0.15, blue = 0.15, alpha = 1.0},
-    radius    = INDICATOR_SIZE / 2 - 3,
-    center    = {x = INDICATOR_SIZE / 2, y = INDICATOR_SIZE / 2},
+    fillColor = {red = RED.red, green = RED.green, blue = RED.blue, alpha = 1.0},
+    radius    = innerR,
+    center    = center,
   }
-  if locked then
-    recIndicator[2] = {
-      type        = "circle",
-      action      = "stroke",
-      strokeColor = {white = 1, alpha = 0.9},
-      strokeWidth = 1.5,
-      radius      = INDICATOR_SIZE / 2 - 1,
-      center      = {x = INDICATOR_SIZE / 2, y = INDICATOR_SIZE / 2},
-    }
-  end
+  local pulseLayerIdx = layerIdx
+
   recIndicator:show()
 
-  if not locked then
-    local t0 = hs.timer.secondsSinceEpoch()
-    recPulseTimer = hs.timer.doEvery(0.04, function()
-      if not recIndicator then return end
-      local elapsed = hs.timer.secondsSinceEpoch() - t0
-      local alpha = 0.35 + 0.65 * (0.5 + 0.5 * math.sin(elapsed * math.pi * 2 / 1.2))
-      recIndicator[1].fillColor = {red = 1, green = 0.15, blue = 0.15, alpha = alpha}
-    end)
-  end
+  -- Pulse the red dot's alpha (period 1.2s, 0.35→1.0)
+  local t0 = hs.timer.secondsSinceEpoch()
+  recPulseTimer = hs.timer.doEvery(0.04, function()
+    if not recIndicator then return end
+    local a = pulseAlpha(t0, 1.2, 0.35, 1.0)
+    recIndicator[pulseLayerIdx].fillColor =
+      {red = RED.red, green = RED.green, blue = RED.blue, alpha = a}
+  end)
 end
 
 local function hideRecordingIndicator()
@@ -78,7 +101,7 @@ local function hideRecordingIndicator()
   if recIndicator then recIndicator:delete(); recIndicator = nil end
 end
 
--- ─── Transcribing indicator (pulsing pen) ────────────────────────────────────
+-- ─── Transcribing indicator (pulsing green dot) ──────────────────────────────
 local transIndicator  = nil
 local transPulseTimer = nil
 
@@ -88,20 +111,21 @@ local function showTranscribingIndicator()
   transIndicator:level(hs.canvas.windowLevels.overlay)
   transIndicator:behavior({"canJoinAllSpaces", "stationary"})
   transIndicator[1] = {
-    type          = "text",
-    text          = "✍️",
-    textSize      = 18,
-    textAlignment = "center",
-    frame         = {x = 0, y = 1, w = INDICATOR_SIZE, h = INDICATOR_SIZE},
+    type      = "circle",
+    action    = "fill",
+    fillColor = {red = GREEN.red, green = GREEN.green, blue = GREEN.blue, alpha = 1.0},
+    radius    = INDICATOR_SIZE / 2 - 3,
+    center    = {x = INDICATOR_SIZE / 2, y = INDICATOR_SIZE / 2},
   }
   transIndicator:show()
 
+  -- Faster pulse (0.7s) signals "working hard"; alpha 0.45 → 1.0
   local t0 = hs.timer.secondsSinceEpoch()
   transPulseTimer = hs.timer.doEvery(0.04, function()
     if not transIndicator then return end
-    local elapsed = hs.timer.secondsSinceEpoch() - t0
-    local alpha = 0.45 + 0.55 * (0.5 + 0.5 * math.sin(elapsed * math.pi * 2 / 0.7))
-    transIndicator:alpha(alpha)
+    local a = pulseAlpha(t0, 0.7, 0.45, 1.0)
+    transIndicator[1].fillColor =
+      {red = GREEN.red, green = GREEN.green, blue = GREEN.blue, alpha = a}
   end)
 end
 
@@ -127,14 +151,13 @@ local function transcribeAndPaste(wavPath)
   task:start()
 end
 
--- Cancel a pending transcribe (called when a double-tap arrives mid-cooldown)
 local function cancelPendingTranscribe()
   if pendingTranscribeTimer then
     pendingTranscribeTimer:stop()
     pendingTranscribeTimer = nil
   end
   hideTranscribingIndicator()
-  os.remove(WAV)  -- discard the orphaned tiny recording
+  os.remove(WAV)
 end
 
 -- ─── Recording lifecycle ─────────────────────────────────────────────────────
@@ -175,7 +198,6 @@ local function startRec(asToggle)
 
   showRecordingIndicator(toggleMode)
 
-  -- Watchdog only runs in hold mode; toggle mode ignores fn-release
   if not toggleMode then
     releaseWatchdog = hs.timer.doEvery(0.03, function()
       if toggleMode then return end
@@ -187,7 +209,6 @@ local function startRec(asToggle)
   end
 end
 
--- Convert an in-flight hold recording into a locked toggle recording
 local function promoteToToggle()
   toggleMode = true
   if releaseWatchdog then releaseWatchdog:stop(); releaseWatchdog = nil end
@@ -208,33 +229,27 @@ fnTap = hs.eventtap.new({
     return false
   end
 
-  if not event:getFlags().fn then return false end  -- ignore fn-UP events here
+  if not event:getFlags().fn then return false end
 
   local now = hs.timer.secondsSinceEpoch()
   local sinceLast = now - lastFnDownTime
   lastFnDownTime = now
 
-  -- Currently locked in toggle mode? Any fn-tap stops it.
   if toggleMode then
     stopRec()
     return false
   end
 
-  -- Double-tap detection: second fn-down within DOUBLE_TAP_WINDOW
   if sinceLast < DOUBLE_TAP_WINDOW then
-    -- Cancel any pending transcribe from the first tap's release
     cancelPendingTranscribe()
     if recording then
-      -- Still hold-recording → just promote to locked
       promoteToToggle()
     else
-      -- Watchdog beat us; start fresh in locked mode
       startRec(true)
     end
     return false
   end
 
-  -- Normal first tap-and-hold
   if not recording then
     startRec(false)
   end

@@ -66,6 +66,13 @@ fi
 echo "→ Disabling macOS built-in dictation..."
 defaults write com.apple.HIToolbox AppleDictationAutoEnable -bool false
 
+# 5b. Set fn-key behavior to "Do Nothing" so it doesn't pop the emoji picker
+# every time you tap it for dictation. Without this, double-tapping fn pops
+# the emoji panel which steals focus from your text field.
+echo "→ Disabling macOS fn-key emoji-picker behavior..."
+defaults write com.apple.HIToolbox AppleFnUsageType -int 0
+killall -HUP cfprefsd 2>/dev/null || true
+
 # 6. Launch Hammerspoon (or reload if already running)
 echo "→ Launching Hammerspoon..."
 if pgrep -x Hammerspoon >/dev/null; then
