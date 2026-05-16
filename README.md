@@ -73,7 +73,7 @@ Check that Hammerspoon is running (look for the hammer icon in the menu bar). Co
 **"Recording starts but no text appears."**
 Open Hammerspoon → Console (menubar). Hold fn, speak, release. The console will print any errors. Common causes:
 - Microphone permission not granted
-- Whisper model path is wrong (check `ls ~/.upscale-talk/models/`)
+- Whisper model path is wrong (check `ls ~/upscale-talk/models/`)
 - `whisper-cli` not on PATH (`which whisper-cli` should print `/opt/homebrew/bin/whisper-cli`)
 
 **"Text pastes into the wrong app."**

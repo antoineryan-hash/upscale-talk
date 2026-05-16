@@ -34,8 +34,8 @@ brew list whisper-cpp        >/dev/null 2>&1 || brew install whisper-cpp
 brew list ffmpeg             >/dev/null 2>&1 || brew install ffmpeg
 
 # 3. Set up our directory + Whisper model
-mkdir -p ~/.upscale-talk/models
-OUR_MODEL="$HOME/.upscale-talk/models/ggml-large-v3-turbo-q5_0.bin"
+mkdir -p ~/upscale-talk/models
+OUR_MODEL="$HOME/upscale-talk/models/ggml-large-v3-turbo-q5_0.bin"
 VOICEINK_MODEL="$HOME/Library/Application Support/com.prakashjoshipax.VoiceInk/WhisperModels/ggml-large-v3-turbo-q5_0.bin"
 MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin"
 

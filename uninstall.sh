@@ -26,8 +26,8 @@ fi
 echo "→ Reloading Hammerspoon..."
 open -g "hammerspoon://reload" 2>/dev/null || true
 
-echo "→ Removing ~/.upscale-talk/ (model + tmp)..."
-rm -rf ~/.upscale-talk
+echo "→ Removing ~/upscale-talk/ (model + tmp)..."
+rm -rf ~/upscale-talk
 
 echo
 echo "✅ Uninstall complete."

@@ -1,17 +1,17 @@
 -- upscale-talk: hold fn → speak → release → text pastes at cursor
 -- Double-tap fn → toggle "locked" recording (hands-free); tap fn again to stop.
--- Every transcription is saved to ~/.upscale-talk/history/ and reachable
+-- Every transcription is saved to ~/upscale-talk/history/ and reachable
 -- via the 🎤 menubar icon (click to copy to clipboard).
 -- Free, local-only Whisper push-to-talk dictation for macOS.
 -- https://github.com/antoineryan-hash/upscale-talk
 
 local HOME    = os.getenv("HOME")
 local WAV     = "/tmp/upscale-talk.wav"
-local MODEL   = HOME .. "/.upscale-talk/models/ggml-large-v3-turbo-q5_0.bin"
+local MODEL   = HOME .. "/upscale-talk/models/ggml-large-v3-turbo-q5_0.bin"
 local FFMPEG  = "/opt/homebrew/bin/ffmpeg"
 local WHISPER = "/opt/homebrew/bin/whisper-cli"
 
-local HISTORY_DIR    = HOME .. "/.upscale-talk/history"
+local HISTORY_DIR    = HOME .. "/upscale-talk/history"
 local HISTORY_MAX    = 20      -- entries shown in menubar
 local DOUBLE_TAP_WINDOW = 0.4
 
