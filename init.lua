@@ -1,13 +1,18 @@
 -- upscale-talk: hold fn → speak → release → text pastes at cursor
 -- Double-tap fn → toggle "locked" recording (hands-free); tap fn again to stop.
+-- Every transcription is saved to ~/.upscale-talk/history/ and reachable
+-- via the 🎤 menubar icon (click to copy to clipboard).
 -- Free, local-only Whisper push-to-talk dictation for macOS.
 -- https://github.com/antoineryan-hash/upscale-talk
 
+local HOME    = os.getenv("HOME")
 local WAV     = "/tmp/upscale-talk.wav"
-local MODEL   = os.getenv("HOME") .. "/.upscale-talk/models/ggml-large-v3-turbo-q5_0.bin"
+local MODEL   = HOME .. "/.upscale-talk/models/ggml-large-v3-turbo-q5_0.bin"
 local FFMPEG  = "/opt/homebrew/bin/ffmpeg"
 local WHISPER = "/opt/homebrew/bin/whisper-cli"
 
+local HISTORY_DIR    = HOME .. "/.upscale-talk/history"
+local HISTORY_MAX    = 20      -- entries shown in menubar
 local DOUBLE_TAP_WINDOW = 0.4
 
 local recording              = false
@@ -16,6 +21,9 @@ local recordingTask          = nil
 local releaseWatchdog        = nil
 local pendingTranscribeTimer = nil
 local lastFnDownTime         = 0
+
+-- Ensure history dir exists at startup
+os.execute("mkdir -p " .. HISTORY_DIR)
 
 -- ─── Indicator anchor (top-right of screen, just below menubar) ──────────────
 local INDICATOR_SIZE   = 22
@@ -32,20 +40,15 @@ local function indicatorFrame()
   }
 end
 
--- Color palette
 local RED   = {red = 1.00, green = 0.15, blue = 0.15}
 local GREEN = {red = 0.20, green = 0.85, blue = 0.30}
-local WHITE = {white = 1.0}
 
--- Build a sine-wave pulse value in [lo, hi] for the given period
 local function pulseAlpha(t0, period, lo, hi)
   local elapsed = hs.timer.secondsSinceEpoch() - t0
   return lo + (hi - lo) * (0.5 + 0.5 * math.sin(elapsed * math.pi * 2 / period))
 end
 
--- ─── Recording indicator ─────────────────────────────────────────────────────
--- Hold mode:   pulsing red dot
--- Locked mode: solid white circle background + pulsing red dot inside
+-- ─── Recording indicator (pulsing red dot; thin white ring when locked) ──────
 local recIndicator  = nil
 local recPulseTimer = nil
 
@@ -58,9 +61,8 @@ local function showRecordingIndicator(locked)
   recIndicator:behavior({"canJoinAllSpaces", "stationary"})
 
   local center = {x = INDICATOR_SIZE / 2, y = INDICATOR_SIZE / 2}
-  local redR   = INDICATOR_SIZE / 2 - 3  -- same size in both modes
+  local redR   = INDICATOR_SIZE / 2 - 3
 
-  -- Red dot (pulses) — same size whether locked or hold
   recIndicator[1] = {
     type      = "circle",
     action    = "fill",
@@ -68,9 +70,6 @@ local function showRecordingIndicator(locked)
     radius    = redR,
     center    = center,
   }
-  local pulseLayerIdx = 1
-
-  -- Locked mode: thin steady white ring around the red dot
   if locked then
     recIndicator[2] = {
       type        = "circle",
@@ -81,16 +80,13 @@ local function showRecordingIndicator(locked)
       center      = center,
     }
   end
-
   recIndicator:show()
 
-  -- Pulse the red dot's alpha (period 1.2s, 0.35→1.0)
   local t0 = hs.timer.secondsSinceEpoch()
   recPulseTimer = hs.timer.doEvery(0.04, function()
     if not recIndicator then return end
     local a = pulseAlpha(t0, 1.2, 0.35, 1.0)
-    recIndicator[pulseLayerIdx].fillColor =
-      {red = RED.red, green = RED.green, blue = RED.blue, alpha = a}
+    recIndicator[1].fillColor = {red = RED.red, green = RED.green, blue = RED.blue, alpha = a}
   end)
 end
 
@@ -117,19 +113,81 @@ local function showTranscribingIndicator()
   }
   transIndicator:show()
 
-  -- Faster pulse (0.7s) signals "working hard"; alpha 0.45 → 1.0
   local t0 = hs.timer.secondsSinceEpoch()
   transPulseTimer = hs.timer.doEvery(0.04, function()
     if not transIndicator then return end
     local a = pulseAlpha(t0, 0.7, 0.45, 1.0)
-    transIndicator[1].fillColor =
-      {red = GREEN.red, green = GREEN.green, blue = GREEN.blue, alpha = a}
+    transIndicator[1].fillColor = {red = GREEN.red, green = GREEN.green, blue = GREEN.blue, alpha = a}
   end)
 end
 
 local function hideTranscribingIndicator()
   if transPulseTimer then transPulseTimer:stop(); transPulseTimer = nil end
   if transIndicator then transIndicator:delete(); transIndicator = nil end
+end
+
+-- ─── Transcription history (menubar) ─────────────────────────────────────────
+local menubar = nil
+local recentTranscriptions = {}  -- [{time = "HH:MM:SS", text = "..."}]
+
+local function refreshMenubar()
+  if not menubar then return end
+  local menu = {}
+  if #recentTranscriptions == 0 then
+    table.insert(menu, {title = "No transcriptions yet — hold fn to dictate", disabled = true})
+  else
+    table.insert(menu, {title = "Recent transcriptions (click to copy)", disabled = true})
+    table.insert(menu, {title = "-"})
+    for _, item in ipairs(recentTranscriptions) do
+      local preview = item.text:gsub("\n", " "):sub(1, 70)
+      if #item.text > 70 then preview = preview .. "…" end
+      table.insert(menu, {
+        title = "[" .. item.time .. "]  " .. preview,
+        fn = function()
+          hs.pasteboard.setContents(item.text)
+          hs.alert.show("📋 Copied to clipboard", 0.7)
+        end,
+      })
+    end
+  end
+  table.insert(menu, {title = "-"})
+  table.insert(menu, {
+    title = "Open History Folder…",
+    fn = function() hs.execute("open " .. HISTORY_DIR) end,
+  })
+  menubar:setMenu(menu)
+end
+
+-- Load existing history files into the in-memory cache at startup
+local function loadHistoryFromDisk()
+  local handle = io.popen("ls -t " .. HISTORY_DIR .. "/*.txt 2>/dev/null | head -" .. HISTORY_MAX)
+  if not handle then return end
+  for path in handle:lines() do
+    local f = io.open(path, "r")
+    if f then
+      local text = f:read("*a") or ""
+      f:close()
+      -- Filename format: YYYY-MM-DD_HH-MM-SS.txt → extract HH:MM:SS
+      local timePart = path:match("(%d%d%-%d%d%-%d%d)%.txt$") or "??-??-??"
+      timePart = timePart:gsub("-", ":")
+      table.insert(recentTranscriptions, {time = timePart, text = text})
+    end
+  end
+  handle:close()
+end
+
+local function saveToHistory(text)
+  -- Write timestamped file
+  local stamp = os.date("%Y-%m-%d_%H-%M-%S")
+  local path = HISTORY_DIR .. "/" .. stamp .. ".txt"
+  local f = io.open(path, "w")
+  if f then f:write(text); f:close() end
+  -- Update in-memory cache (newest first)
+  table.insert(recentTranscriptions, 1, {time = os.date("%H:%M:%S"), text = text})
+  while #recentTranscriptions > HISTORY_MAX do
+    table.remove(recentTranscriptions)
+  end
+  refreshMenubar()
 end
 
 -- ─── Async transcribe + paste ────────────────────────────────────────────────
@@ -139,6 +197,12 @@ local function transcribeAndPaste(wavPath)
     if exitCode ~= 0 then return end
     local text = (stdOut or ""):gsub("^%s+", ""):gsub("%s+$", "")
     if #text == 0 then return end
+
+    -- Save to history FIRST — so even if the paste lands in the wrong window,
+    -- the transcription is recoverable from the menubar / history folder.
+    saveToHistory(text)
+
+    -- Then attempt to paste at the current cursor
     local prev = hs.pasteboard.getContents()
     hs.pasteboard.setContents(text)
     hs.osascript.applescript([[tell application "System Events" to keystroke "v" using command down]])
@@ -176,7 +240,9 @@ local function stopRec()
     pendingTranscribeTimer = nil
     os.execute(string.format("mv %q %q 2>/dev/null", WAV, snapshotPath))
     transcribeAndPaste(snapshotPath)
-    hs.timer.doAfter(10, function() os.remove(snapshotPath) end)
+    -- Keep WAVs around for 5 minutes (was 10s) — enough buffer to re-transcribe
+    -- if something goes wrong, but bounded so /tmp doesn't fill up
+    hs.timer.doAfter(300, function() os.remove(snapshotPath) end)
   end)
 end
 
@@ -254,5 +320,14 @@ fnTap = hs.eventtap.new({
   return false
 end)
 fnTap:start()
+
+-- ─── Menubar setup (must come AFTER refreshMenubar definition) ───────────────
+menubar = hs.menubar.new()
+if menubar then
+  menubar:setTitle("🎤")
+  menubar:setTooltip("upscale-talk — recent transcriptions")
+  loadHistoryFromDisk()
+  refreshMenubar()
+end
 
 hs.alert.show("upscale-talk ready — hold fn to dictate, double-tap fn to lock on", 2.0)
