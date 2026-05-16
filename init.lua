@@ -58,31 +58,29 @@ local function showRecordingIndicator(locked)
   recIndicator:behavior({"canJoinAllSpaces", "stationary"})
 
   local center = {x = INDICATOR_SIZE / 2, y = INDICATOR_SIZE / 2}
-  local outerR = INDICATOR_SIZE / 2 - 2  -- ~9
-  local innerR = locked and (INDICATOR_SIZE / 2 - 6) or outerR  -- ~5 inside, or full
-  local layerIdx = 1
+  local redR   = INDICATOR_SIZE / 2 - 3  -- same size in both modes
 
-  if locked then
-    -- Solid white circle as the steady "locked" frame
-    recIndicator[layerIdx] = {
-      type      = "circle",
-      action    = "fill",
-      fillColor = {white = 1.0, alpha = 1.0},
-      radius    = outerR,
-      center    = center,
-    }
-    layerIdx = layerIdx + 1
-  end
-
-  -- Red dot (the part that pulses)
-  recIndicator[layerIdx] = {
+  -- Red dot (pulses) — same size whether locked or hold
+  recIndicator[1] = {
     type      = "circle",
     action    = "fill",
     fillColor = {red = RED.red, green = RED.green, blue = RED.blue, alpha = 1.0},
-    radius    = innerR,
+    radius    = redR,
     center    = center,
   }
-  local pulseLayerIdx = layerIdx
+  local pulseLayerIdx = 1
+
+  -- Locked mode: thin steady white ring around the red dot
+  if locked then
+    recIndicator[2] = {
+      type        = "circle",
+      action      = "stroke",
+      strokeColor = {white = 1.0, alpha = 0.9},
+      strokeWidth = 1.5,
+      radius      = INDICATOR_SIZE / 2 - 1,
+      center      = center,
+    }
+  end
 
   recIndicator:show()
 
