@@ -9,27 +9,19 @@ local WHISPER = "/opt/homebrew/bin/whisper-cli"
 
 local recording = false
 local recordingTask = nil
-
-local function startRec()
-  if recording then return end
-  recording = true
-  os.remove(WAV)
-  recordingTask = hs.task.new(FFMPEG, nil,
-    {"-f", "avfoundation", "-i", ":0", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "-y", WAV})
-  recordingTask:start()
-  hs.alert.show("🎤", 0.3)
-end
+local releaseWatchdog = nil
 
 local function stopRec()
   if not recording then return end
   recording = false
+  if releaseWatchdog then releaseWatchdog:stop(); releaseWatchdog = nil end
   if recordingTask then
     recordingTask:terminate()
     recordingTask = nil
   end
   hs.alert.show("⏳", 0.3)
 
-  -- Give ffmpeg a moment to finalise the WAV header
+  -- Give ffmpeg ~0.3s to finalise the WAV header
   hs.timer.doAfter(0.3, function()
     local cmd = string.format("%s -m %q -f %q -nt -np 2>/dev/null", WHISPER, MODEL, WAV)
     local out = hs.execute(cmd)
@@ -45,13 +37,31 @@ local function stopRec()
   end)
 end
 
--- fn key (Globe) listener via flagsChanged event tap.
--- event:getFlags().fn is true on press, false on release.
+local function startRec()
+  if recording then return end
+  recording = true
+  os.remove(WAV)
+  recordingTask = hs.task.new(FFMPEG, nil,
+    {"-f", "avfoundation", "-i", ":0", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "-y", WAV})
+  recordingTask:start()
+  hs.alert.show("🎤", 0.3)
+
+  -- On macOS 26+, the fn-UP flagsChanged event is sometimes swallowed by
+  -- the system before reaching our event tap. Poll every 30ms while we're
+  -- recording to catch the release reliably. Stops itself once fn goes false.
+  releaseWatchdog = hs.timer.doEvery(0.03, function()
+    local mods = hs.eventtap.checkKeyboardModifiers()
+    if not mods.fn then
+      stopRec()
+    end
+  end)
+end
+
+-- fn key (Globe) listener for the DOWN edge via flagsChanged event tap.
+-- We don't rely on this for the UP edge — see releaseWatchdog in startRec().
 local fnTap = hs.eventtap.new({hs.eventtap.event.types.flagsChanged}, function(event)
-  if event:getFlags().fn then
+  if event:getFlags().fn and not recording then
     startRec()
-  else
-    stopRec()
   end
   return false
 end)
