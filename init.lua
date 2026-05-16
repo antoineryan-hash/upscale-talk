@@ -25,6 +25,10 @@ local lastFnDownTime         = 0
 -- Ensure history dir exists at startup
 os.execute("mkdir -p " .. HISTORY_DIR)
 
+-- Kill any orphan ffmpeg processes left from a previous Hammerspoon session
+-- (cold-restart can detach our child ffmpeg, leaving it recording forever)
+os.execute("pkill -f 'ffmpeg.*upscale-talk' 2>/dev/null; true")
+
 -- ─── Indicator anchor (top-right of screen, just below menubar) ──────────────
 local INDICATOR_SIZE   = 22
 local INDICATOR_MARGIN = 24
@@ -232,6 +236,10 @@ local function stopRec()
     recordingTask:terminate()
     recordingTask = nil
   end
+  -- Belt-and-suspenders: if terminate() didn't actually kill ffmpeg (happens
+  -- if the task was orphaned by a Hammerspoon restart), force-kill it via
+  -- shell. Without this, ffmpeg keeps recording silence into the WAV forever.
+  os.execute("pkill -f 'ffmpeg.*upscale-talk' 2>/dev/null; true")
   hideRecordingIndicator()
   showTranscribingIndicator()
 
