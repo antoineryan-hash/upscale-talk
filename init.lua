@@ -41,14 +41,22 @@ local function startRec()
   if recording then return end
   recording = true
   os.remove(WAV)
+
+  -- Query the system's current default input device by NAME so we don't
+  -- accidentally record from a virtual loopback (e.g. Loom, BlackHole) that
+  -- happens to have a lower device index than the real mic.
+  local dev = hs.audiodevice.defaultInputDevice()
+  local devName = dev and dev:name() or "MacBook Pro Microphone"
+
   recordingTask = hs.task.new(FFMPEG, nil,
-    {"-f", "avfoundation", "-i", ":0", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "-y", WAV})
+    {"-f", "avfoundation", "-i", ":" .. devName,
+     "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "-y", WAV})
   recordingTask:start()
   hs.alert.show("🎤", 0.3)
 
   -- On macOS 26+, the fn-UP flagsChanged event is sometimes swallowed by
   -- the system before reaching our event tap. Poll every 30ms while we're
-  -- recording to catch the release reliably. Stops itself once fn goes false.
+  -- recording to catch the release reliably.
   releaseWatchdog = hs.timer.doEvery(0.03, function()
     local mods = hs.eventtap.checkKeyboardModifiers()
     if not mods.fn then
