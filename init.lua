@@ -30,6 +30,17 @@ local bgRecorder    = nil
 local bgStartEpoch  = 0     -- epoch when the current bg ffmpeg started writing
 local bgShuttingDown = false
 
+-- Diagnostic log path (so we can debug from shell without opening the in-app Console)
+local DIAG_LOG = "/tmp/upscale-talk-diag.log"
+local function diag(msg)
+  print(msg)
+  local f = io.open(DIAG_LOG, "a")
+  if f then
+    f:write(os.date("%H:%M:%S") .. " " .. msg .. "\n")
+    f:close()
+  end
+end
+
 -- Ensure dirs exist at startup
 os.execute("mkdir -p " .. HISTORY_DIR)
 
@@ -260,26 +271,35 @@ local function extractAndTranscribe(pressEpoch, releaseEpoch)
   local duration = (releaseEpoch - pressEpoch) + PRE_ROLL_SECS
   if duration < 0.2 then duration = 0.2 end  -- min sanity floor
 
+  -- Check actual buffer file size for sanity
+  local bufferAttr = hs.fs.attributes(BUFFER_WAV)
+  local bufferSecs = bufferAttr and (bufferAttr.size - 44) / 32000 or 0  -- minus WAV header, /bytes-per-sec
+  diag(string.format(
+    "[extract] startOffset=%.2f duration=%.2f bufferSize=%.2fs",
+    startOffset, duration, bufferSecs
+  ))
+
   local snapshotPath = "/tmp/upscale-talk-" .. os.time() .. "-" .. math.random(1000, 9999) .. ".wav"
 
-  -- Use ffmpeg to extract the slice from the buffer.
-  -- -ignore_length 1: the buffer WAV is being actively written by another ffmpeg,
-  --   so its header length field is wrong (placeholder while file is open).
-  --   This flag tells ffmpeg to ignore the header length and read to EOF.
-  -- -acodec copy: no re-encode (PCM stays PCM)
   local extractCmd = string.format(
-    "%s -ignore_length 1 -ss %.3f -t %.3f -i %q -acodec copy %q 2>/dev/null",
+    "%s -ignore_length 1 -ss %.3f -t %.3f -i %q -acodec copy %q",
     FFMPEG, startOffset, duration, BUFFER_WAV, snapshotPath
   )
 
   -- Run extraction async so we don't block; then transcribe on completion
-  hs.task.new("/bin/sh", function(exitCode, _, _)
-    if exitCode ~= 0 then
+  hs.task.new("/bin/sh", function(exitCode, stdOut, stdErr)
+    local outAttr = hs.fs.attributes(snapshotPath)
+    local outSize = outAttr and outAttr.size or 0
+    diag(string.format(
+      "[extract] done: exit=%d outSize=%d",
+      exitCode, outSize
+    ))
+    if exitCode ~= 0 or outSize < 1000 then
+      diag("[extract] FAILED stderr: " .. (stdErr or "(empty)"))
       hideTranscribingIndicator()
       return
     end
     transcribeAndPaste(snapshotPath)
-    -- Clean up the snapshot after 5 min
     hs.timer.doAfter(300, function() os.remove(snapshotPath) end)
   end, {"-c", extractCmd}):start()
 end
@@ -302,13 +322,29 @@ local function stopRec(releaseEpoch)
   showTranscribingIndicator()
 
   local pressEpoch = fnPressEpoch
-  -- Schedule extraction. 0.5s delay so the bg ffmpeg's stdio buffer has time
-  -- to flush the just-recorded audio to disk before our extraction reads it.
-  -- (Paired with -flush_packets 1 on the bg ffmpeg.)
-  pendingExtractTimer = hs.timer.doAfter(0.5, function()
-    pendingExtractTimer = nil
-    extractAndTranscribe(pressEpoch, releaseEpoch)
+  -- Wait until the buffer file has actually been written through the release
+  -- timestamp before extracting. ffmpeg's avfoundation input batches frames
+  -- into packets (~1s each), so even with -flush_packets 1 the most recent
+  -- 1-3s of audio sits in ffmpeg memory until the next packet flushes.
+  -- Poll the file size, give it up to 4s to catch up.
+  local targetBytes = math.floor(((releaseEpoch - bgStartEpoch) * 32000)) + 44
+  local pollStart = hs.timer.secondsSinceEpoch()
+  local pollTimer
+  pollTimer = hs.timer.doEvery(0.05, function()
+    local attr = hs.fs.attributes(BUFFER_WAV)
+    local size = attr and attr.size or 0
+    local elapsed = hs.timer.secondsSinceEpoch() - pollStart
+    if size >= targetBytes or elapsed > 4.0 then
+      pollTimer:stop()
+      diag(string.format(
+        "[wait] caught up: targetBytes=%d gotBytes=%d waited=%.2fs",
+        targetBytes, size, elapsed
+      ))
+      extractAndTranscribe(pressEpoch, releaseEpoch)
+    end
   end)
+  -- Stash so cancelPendingExtract can stop it if a double-tap arrives
+  pendingExtractTimer = pollTimer
 end
 
 local function startRec(asToggle)
