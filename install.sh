@@ -59,7 +59,16 @@ else
   if [ -f ~/.hammerspoon/init.lua ]; then
     printf "\n\n-- ===== upscale-talk =====\n" >> ~/.hammerspoon/init.lua
   fi
-  curl -fsSL "$REPO_RAW/init.lua" >> ~/.hammerspoon/init.lua
+  # Prefer a local init.lua sitting next to this install script (zip distribution).
+  # Fall back to fetching from GitHub (curl-pipe distribution).
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [ -f "$SCRIPT_DIR/init.lua" ]; then
+    echo "  using local init.lua from $SCRIPT_DIR"
+    cat "$SCRIPT_DIR/init.lua" >> ~/.hammerspoon/init.lua
+  else
+    echo "  fetching init.lua from $REPO_RAW"
+    curl -fsSL "$REPO_RAW/init.lua" >> ~/.hammerspoon/init.lua
+  fi
 fi
 
 # 5. Disable macOS built-in dictation (avoids fn-key conflict)
