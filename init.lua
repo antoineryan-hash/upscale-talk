@@ -130,10 +130,12 @@ local function hideTranscribingIndicator()
   if transIndicator then transIndicator:delete(); transIndicator = nil end
 end
 
--- ─── Warmup indicator (pulsing ⏳ hourglass — "DON'T speak yet") ─────────────
--- Shown the instant fn is pressed, while ffmpeg is opening the audio device.
--- Switches to the red recording dot the moment the WAV file actually has
--- bytes (= ffmpeg has captured the first sample = mic is genuinely live).
+-- ─── Warmup indicator: solid red dot in damped circular orbit ────────────────
+-- "Guitar string settling to rest" — shown the instant fn is pressed, while
+-- ffmpeg is opening the audio device. The dot spins in a small orbit whose
+-- radius exponentially decays. When the WAV file actually has bytes (ffmpeg
+-- captured first sample = mic is live), the orbit ends and the regular
+-- pulsing red recording indicator takes over.
 local warmupIndicator  = nil
 local warmupPulseTimer = nil
 local warmupPoll       = nil
@@ -145,19 +147,36 @@ local function showWarmupIndicator()
   warmupIndicator = hs.canvas.new(indicatorFrame())
   warmupIndicator:level(hs.canvas.windowLevels.overlay)
   warmupIndicator:behavior({"canJoinAllSpaces", "stationary"})
+
+  local centerX = INDICATOR_SIZE / 2
+  local centerY = INDICATOR_SIZE / 2
+  local dotR    = INDICATOR_SIZE / 2 - 5  -- slightly smaller so orbit fits in frame
+
   warmupIndicator[1] = {
-    type          = "text",
-    text          = "⏳",
-    textSize      = 18,
-    textAlignment = "center",
-    frame         = {x = 0, y = 1, w = INDICATOR_SIZE, h = INDICATOR_SIZE},
+    type      = "circle",
+    action    = "fill",
+    fillColor = {red = RED.red, green = RED.green, blue = RED.blue, alpha = 1.0},
+    radius    = dotR,
+    center    = {x = centerX, y = centerY},
   }
   warmupIndicator:show()
 
+  -- Damped circular orbit: amp = INITIAL * exp(-t / TAU)
+  -- INITIAL=4px, TAU=0.25s → amp at 250ms = 1.5px, at 500ms = 0.5px, at 750ms = 0.2px
   local t0 = hs.timer.secondsSinceEpoch()
-  warmupPulseTimer = hs.timer.doEvery(0.04, function()
+  local INITIAL_AMP = 4.0
+  local FREQ        = 9.0   -- revolutions per second (snappy guitar-string feel)
+  local DAMP_TAU    = 0.25  -- seconds
+
+  warmupPulseTimer = hs.timer.doEvery(0.02, function()
     if not warmupIndicator then return end
-    warmupIndicator:alpha(pulseAlpha(t0, 0.6, 0.4, 1.0))
+    local elapsed = hs.timer.secondsSinceEpoch() - t0
+    local amp     = INITIAL_AMP * math.exp(-elapsed / DAMP_TAU)
+    local angle   = elapsed * FREQ * 2 * math.pi
+    warmupIndicator[1].center = {
+      x = centerX + amp * math.cos(angle),
+      y = centerY + amp * math.sin(angle),
+    }
   end)
 end
 
