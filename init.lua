@@ -25,6 +25,52 @@ local lastFnDownTime         = 0
 -- Ensure history dir exists at startup
 os.execute("mkdir -p " .. HISTORY_DIR)
 
+-- ─── Auto-calibrate ffmpeg startup latency for this machine ──────────────────
+-- The animation duration is tuned from this value so the visual "settles"
+-- right when ffmpeg actually starts capturing — no fixed magic numbers, no
+-- per-Mac tweaking needed.
+local MEASURED_STARTUP_SECS = 0.4  -- fallback default, replaced on first calibration
+
+local function calibrateStartup()
+  local testWav = "/tmp/upscale-talk-calibrate.wav"
+  os.remove(testWav)
+  local dev = hs.audiodevice.defaultInputDevice()
+  local devName = dev and dev:name() or "MacBook Pro Microphone"
+  local startEpoch = hs.timer.secondsSinceEpoch()
+  local task = hs.task.new("/opt/homebrew/bin/ffmpeg", function(_, _, _)
+    os.remove(testWav)
+  end, {
+    "-f", "avfoundation", "-i", ":" .. devName,
+    "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+    "-flush_packets", "1",
+    "-t", "1.5",  -- only need a short test
+    "-y", testWav,
+  })
+  task:start()
+
+  -- Poll for first audio bytes, then record the latency
+  local poll
+  poll = hs.timer.doEvery(0.02, function()
+    local attr = hs.fs.attributes(testWav)
+    local size = attr and attr.size or 0
+    local elapsed = hs.timer.secondsSinceEpoch() - startEpoch
+    if size > 100 then
+      MEASURED_STARTUP_SECS = elapsed
+      print(string.format("[upscale-talk] calibrated ffmpeg startup: %.3fs", elapsed))
+      poll:stop()
+      task:terminate()
+    elseif elapsed > 3.0 then
+      -- Calibration failed (mic in use? permission missing?). Keep fallback.
+      print("[upscale-talk] calibration timeout — keeping default 0.4s")
+      poll:stop()
+      task:terminate()
+    end
+  end)
+end
+
+-- Run calibration after Hammerspoon settles (don't fight startup)
+hs.timer.doAfter(2.0, calibrateStartup)
+
 -- Kill any orphan ffmpeg processes left from a previous Hammerspoon session
 -- (cold-restart can detach our child ffmpeg, leaving it recording forever)
 os.execute("pkill -9 -f 'ffmpeg.*upscale-talk' 2>/dev/null; true")
@@ -162,13 +208,13 @@ local function showWarmupIndicator()
   warmupIndicator:show()
 
   -- Damped circular orbit: amp = INITIAL * exp(-t / TAU)
-  -- Tuned so the dot is visually settled around ~250ms, while ffmpeg's actual
-  -- audio device opens around ~360ms — visual reads as "settled = ready" even
-  -- though there's a tiny tail. Faster, snappier, less "loading-screen" vibe.
+  -- DAMP_TAU is auto-tuned from the measured ffmpeg startup latency so the
+  -- visual is ~95% settled exactly when ffmpeg crosses the readiness threshold.
+  -- (exp(-3) ≈ 0.05, so tau = MEASURED / 3.)
   local t0 = hs.timer.secondsSinceEpoch()
   local INITIAL_AMP = 3.5
-  local FREQ        = 12.0  -- revolutions per second (fast, urgent settling)
-  local DAMP_TAU    = 0.10  -- seconds — at 250ms amp is ~8% of initial, looks still
+  local FREQ        = 12.0
+  local DAMP_TAU    = MEASURED_STARTUP_SECS / 3.0
 
   warmupPulseTimer = hs.timer.doEvery(0.02, function()
     if not warmupIndicator then return end
@@ -337,13 +383,14 @@ local function startRec(asToggle)
 
   -- Poll the WAV file size. The moment ffmpeg has written any real audio data
   -- (file size > WAV-header-only), switch from warmup to red recording dot.
-  -- Hard-cap the warmup at 1s so we never get stuck if polling can't tell.
+  -- Timeout fallback is 2× the calibrated startup time (safety margin).
   local pollStart = hs.timer.secondsSinceEpoch()
+  local timeoutSecs = math.max(MEASURED_STARTUP_SECS * 2.5, 0.8)
   warmupPoll = hs.timer.doEvery(0.03, function()
     local attr = hs.fs.attributes(WAV)
     local size = attr and attr.size or 0
     local elapsed = hs.timer.secondsSinceEpoch() - pollStart
-    if size > 100 or elapsed > 1.0 then  -- > header bytes OR 1s fallback
+    if size > 100 or elapsed > timeoutSecs then
       if warmupPoll then warmupPoll:stop(); warmupPoll = nil end
       hideWarmupIndicator()
       showRecordingIndicator(toggleMode)
