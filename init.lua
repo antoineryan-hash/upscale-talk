@@ -6,45 +6,27 @@
 -- https://github.com/antoineryan-hash/upscale-talk
 
 local HOME    = os.getenv("HOME")
+local WAV     = "/tmp/upscale-talk.wav"
 local MODEL   = HOME .. "/upscale-talk/models/ggml-large-v3-turbo-q5_0.bin"
 local FFMPEG  = "/opt/homebrew/bin/ffmpeg"
 local WHISPER = "/opt/homebrew/bin/whisper-cli"
 
-local BUFFER_WAV  = "/tmp/upscale-talk-buffer.wav"
-local PRE_ROLL_SECS = 0.5  -- include audio from 0.5s BEFORE fn-press
-local BG_CYCLE_SECS = 3600 -- restart background ffmpeg every 60 min (bounds buffer to ~115 MB)
-
 local HISTORY_DIR    = HOME .. "/upscale-talk/history"
-local HISTORY_MAX    = 20
+local HISTORY_MAX    = 20      -- entries shown in menubar
 local DOUBLE_TAP_WINDOW = 0.4
 
 local recording              = false
 local toggleMode             = false
+local recordingTask          = nil
 local releaseWatchdog        = nil
-local pendingExtractTimer    = nil
+local pendingTranscribeTimer = nil
 local lastFnDownTime         = 0
-local fnPressEpoch           = 0
 
--- Background recorder state
-local bgRecorder    = nil
-local bgStartEpoch  = 0     -- epoch when the current bg ffmpeg started writing
-local bgShuttingDown = false
-
--- Diagnostic log path (so we can debug from shell without opening the in-app Console)
-local DIAG_LOG = "/tmp/upscale-talk-diag.log"
-local function diag(msg)
-  print(msg)
-  local f = io.open(DIAG_LOG, "a")
-  if f then
-    f:write(os.date("%H:%M:%S") .. " " .. msg .. "\n")
-    f:close()
-  end
-end
-
--- Ensure dirs exist at startup
+-- Ensure history dir exists at startup
 os.execute("mkdir -p " .. HISTORY_DIR)
 
 -- Kill any orphan ffmpeg processes left from a previous Hammerspoon session
+-- (cold-restart can detach our child ffmpeg, leaving it recording forever)
 os.execute("pkill -9 -f 'ffmpeg.*upscale-talk' 2>/dev/null; true")
 
 -- ─── Indicator anchor (top-right of screen, just below menubar) ──────────────
@@ -150,7 +132,7 @@ end
 
 -- ─── Transcription history (menubar) ─────────────────────────────────────────
 local menubar = nil
-local recentTranscriptions = {}
+local recentTranscriptions = {}  -- [{time = "HH:MM:SS", text = "..."}]
 
 local function refreshMenubar()
   if not menubar then return end
@@ -180,6 +162,7 @@ local function refreshMenubar()
   menubar:setMenu(menu)
 end
 
+-- Load existing history files into the in-memory cache at startup
 local function loadHistoryFromDisk()
   local handle = io.popen("ls -t " .. HISTORY_DIR .. "/*.txt 2>/dev/null | head -" .. HISTORY_MAX)
   if not handle then return end
@@ -188,6 +171,7 @@ local function loadHistoryFromDisk()
     if f then
       local text = f:read("*a") or ""
       f:close()
+      -- Filename format: YYYY-MM-DD_HH-MM-SS.txt → extract HH:MM:SS
       local timePart = path:match("(%d%d%-%d%d%-%d%d)%.txt$") or "??-??-??"
       timePart = timePart:gsub("-", ":")
       table.insert(recentTranscriptions, {time = timePart, text = text})
@@ -197,49 +181,17 @@ local function loadHistoryFromDisk()
 end
 
 local function saveToHistory(text)
+  -- Write timestamped file
   local stamp = os.date("%Y-%m-%d_%H-%M-%S")
   local path = HISTORY_DIR .. "/" .. stamp .. ".txt"
   local f = io.open(path, "w")
   if f then f:write(text); f:close() end
+  -- Update in-memory cache (newest first)
   table.insert(recentTranscriptions, 1, {time = os.date("%H:%M:%S"), text = text})
   while #recentTranscriptions > HISTORY_MAX do
     table.remove(recentTranscriptions)
   end
   refreshMenubar()
-end
-
--- ─── Background recorder (continuous capture to rolling buffer) ──────────────
--- ffmpeg runs in the background writing to BUFFER_WAV. Restarts every
--- BG_CYCLE_SECS to bound the file size. This eliminates the per-recording
--- audio-device cold-start latency that was cutting off the first word.
-
-local startBackgroundRecorder  -- forward declaration
-
-startBackgroundRecorder = function()
-  if bgShuttingDown then return end
-  local dev = hs.audiodevice.defaultInputDevice()
-  local devName = dev and dev:name() or "MacBook Pro Microphone"
-
-  os.remove(BUFFER_WAV)
-  bgStartEpoch = hs.timer.secondsSinceEpoch()
-
-  bgRecorder = hs.task.new(FFMPEG, function(_exit, _out, _err)
-    -- ffmpeg exited (either we killed it, OR it hit -t limit). Respawn unless shutting down.
-    bgRecorder = nil
-    if not bgShuttingDown then
-      hs.timer.doAfter(0.05, startBackgroundRecorder)
-    end
-  end, {
-    "-f", "avfoundation", "-i", ":" .. devName,
-    "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
-    -- -flush_packets 1: flush to disk after every packet so that extractions
-    -- reading the file see the most recent audio (avoids stale-EOF where the
-    -- last 500ms of audio is still in ffmpeg's stdio buffer).
-    "-flush_packets", "1",
-    "-t", tostring(BG_CYCLE_SECS),
-    "-y", BUFFER_WAV
-  })
-  bgRecorder:start()
 end
 
 -- ─── Async transcribe + paste ────────────────────────────────────────────────
@@ -250,8 +202,11 @@ local function transcribeAndPaste(wavPath)
     local text = (stdOut or ""):gsub("^%s+", ""):gsub("%s+$", "")
     if #text == 0 then return end
 
+    -- Save to history FIRST — so even if the paste lands in the wrong window,
+    -- the transcription is recoverable from the menubar / history folder.
     saveToHistory(text)
 
+    -- Then attempt to paste at the current cursor
     local prev = hs.pasteboard.getContents()
     hs.pasteboard.setContents(text)
     hs.osascript.applescript([[tell application "System Events" to keystroke "v" using command down]])
@@ -262,96 +217,56 @@ local function transcribeAndPaste(wavPath)
   task:start()
 end
 
--- Extract the relevant slice from the rolling buffer and pass to whisper.
--- pressEpoch / releaseEpoch are real-world epochs from hs.timer.secondsSinceEpoch().
-local function extractAndTranscribe(pressEpoch, releaseEpoch)
-  -- Compute offset within the current buffer file
-  local startOffset = (pressEpoch - bgStartEpoch) - PRE_ROLL_SECS
-  if startOffset < 0 then startOffset = 0 end
-  local duration = (releaseEpoch - pressEpoch) + PRE_ROLL_SECS
-  if duration < 0.2 then duration = 0.2 end  -- min sanity floor
-
-  -- Check actual buffer file size for sanity
-  local bufferAttr = hs.fs.attributes(BUFFER_WAV)
-  local bufferSecs = bufferAttr and (bufferAttr.size - 44) / 32000 or 0  -- minus WAV header, /bytes-per-sec
-  diag(string.format(
-    "[extract] startOffset=%.2f duration=%.2f bufferSize=%.2fs",
-    startOffset, duration, bufferSecs
-  ))
-
-  local snapshotPath = "/tmp/upscale-talk-" .. os.time() .. "-" .. math.random(1000, 9999) .. ".wav"
-
-  local extractCmd = string.format(
-    "%s -ignore_length 1 -ss %.3f -t %.3f -i %q -acodec copy %q",
-    FFMPEG, startOffset, duration, BUFFER_WAV, snapshotPath
-  )
-
-  -- Run extraction async so we don't block; then transcribe on completion
-  hs.task.new("/bin/sh", function(exitCode, stdOut, stdErr)
-    local outAttr = hs.fs.attributes(snapshotPath)
-    local outSize = outAttr and outAttr.size or 0
-    diag(string.format(
-      "[extract] done: exit=%d outSize=%d",
-      exitCode, outSize
-    ))
-    if exitCode ~= 0 or outSize < 1000 then
-      diag("[extract] FAILED stderr: " .. (stdErr or "(empty)"))
-      hideTranscribingIndicator()
-      return
-    end
-    transcribeAndPaste(snapshotPath)
-    hs.timer.doAfter(300, function() os.remove(snapshotPath) end)
-  end, {"-c", extractCmd}):start()
-end
-
-local function cancelPendingExtract()
-  if pendingExtractTimer then
-    pendingExtractTimer:stop()
-    pendingExtractTimer = nil
+local function cancelPendingTranscribe()
+  if pendingTranscribeTimer then
+    pendingTranscribeTimer:stop()
+    pendingTranscribeTimer = nil
   end
   hideTranscribingIndicator()
+  os.remove(WAV)
 end
 
--- ─── Recording lifecycle (now just timestamp tracking + buffer extraction) ───
-local function stopRec(releaseEpoch)
+-- ─── Recording lifecycle ─────────────────────────────────────────────────────
+local function stopRec()
   if not recording then return end
   recording = false
   toggleMode = false
   if releaseWatchdog then releaseWatchdog:stop(); releaseWatchdog = nil end
+  if recordingTask then
+    recordingTask:terminate()
+    recordingTask = nil
+  end
+  -- Belt-and-suspenders: if terminate() didn't actually kill ffmpeg (happens
+  -- if the task was orphaned by a Hammerspoon restart), force-kill it via
+  -- shell. Without this, ffmpeg keeps recording silence into the WAV forever.
+  os.execute("pkill -9 -f 'ffmpeg.*upscale-talk' 2>/dev/null; true")
   hideRecordingIndicator()
   showTranscribingIndicator()
 
-  local pressEpoch = fnPressEpoch
-  -- Wait until the buffer file has actually been written through the release
-  -- timestamp before extracting. ffmpeg's avfoundation input batches frames
-  -- into packets (~1s each), so even with -flush_packets 1 the most recent
-  -- 1-3s of audio sits in ffmpeg memory until the next packet flushes.
-  -- Poll the file size, give it up to 4s to catch up.
-  local targetBytes = math.floor(((releaseEpoch - bgStartEpoch) * 32000)) + 44
-  local pollStart = hs.timer.secondsSinceEpoch()
-  local pollTimer
-  pollTimer = hs.timer.doEvery(0.05, function()
-    local attr = hs.fs.attributes(BUFFER_WAV)
-    local size = attr and attr.size or 0
-    local elapsed = hs.timer.secondsSinceEpoch() - pollStart
-    if size >= targetBytes or elapsed > 4.0 then
-      pollTimer:stop()
-      diag(string.format(
-        "[wait] caught up: targetBytes=%d gotBytes=%d waited=%.2fs",
-        targetBytes, size, elapsed
-      ))
-      extractAndTranscribe(pressEpoch, releaseEpoch)
-    end
+  local snapshotPath = "/tmp/upscale-talk-" .. os.time() .. "-" .. math.random(1000, 9999) .. ".wav"
+  pendingTranscribeTimer = hs.timer.doAfter(0.3, function()
+    pendingTranscribeTimer = nil
+    os.execute(string.format("mv %q %q 2>/dev/null", WAV, snapshotPath))
+    transcribeAndPaste(snapshotPath)
+    -- Keep WAVs around for 5 minutes (was 10s) — enough buffer to re-transcribe
+    -- if something goes wrong, but bounded so /tmp doesn't fill up
+    hs.timer.doAfter(300, function() os.remove(snapshotPath) end)
   end)
-  -- Stash so cancelPendingExtract can stop it if a double-tap arrives
-  pendingExtractTimer = pollTimer
 end
 
 local function startRec(asToggle)
   if recording then return end
   recording = true
   toggleMode = asToggle and true or false
-  fnPressEpoch = hs.timer.secondsSinceEpoch()
+  os.remove(WAV)
+
+  local dev = hs.audiodevice.defaultInputDevice()
+  local devName = dev and dev:name() or "MacBook Pro Microphone"
+
+  recordingTask = hs.task.new(FFMPEG, nil,
+    {"-f", "avfoundation", "-i", ":" .. devName,
+     "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "-y", WAV})
+  recordingTask:start()
 
   showRecordingIndicator(toggleMode)
 
@@ -360,7 +275,7 @@ local function startRec(asToggle)
       if toggleMode then return end
       local mods = hs.eventtap.checkKeyboardModifiers()
       if not mods.fn then
-        stopRec(hs.timer.secondsSinceEpoch())
+        stopRec()
       end
     end)
   end
@@ -393,12 +308,12 @@ fnTap = hs.eventtap.new({
   lastFnDownTime = now
 
   if toggleMode then
-    stopRec(now)
+    stopRec()
     return false
   end
 
   if sinceLast < DOUBLE_TAP_WINDOW then
-    cancelPendingExtract()
+    cancelPendingTranscribe()
     if recording then
       promoteToToggle()
     else
@@ -414,7 +329,7 @@ fnTap = hs.eventtap.new({
 end)
 fnTap:start()
 
--- ─── Menubar setup ───────────────────────────────────────────────────────────
+-- ─── Menubar setup (must come AFTER refreshMenubar definition) ───────────────
 menubar = hs.menubar.new()
 if menubar then
   menubar:setTitle("🎤")
@@ -423,13 +338,4 @@ if menubar then
   refreshMenubar()
 end
 
--- ─── Kick off the background recorder ────────────────────────────────────────
-startBackgroundRecorder()
-
--- Clean shutdown on Hammerspoon exit/reload
-hs.shutdownCallback = function()
-  bgShuttingDown = true
-  os.execute("pkill -9 -f 'ffmpeg.*upscale-talk' 2>/dev/null; true")
-end
-
-hs.alert.show("upscale-talk ready — hold fn (no startup lag now)", 2.0)
+hs.alert.show("upscale-talk ready — hold fn to dictate, double-tap fn to lock on", 2.0)
