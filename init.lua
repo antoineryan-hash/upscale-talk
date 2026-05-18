@@ -208,13 +208,14 @@ local function showWarmupIndicator()
   warmupIndicator:show()
 
   -- Damped circular orbit: amp = INITIAL * exp(-t / TAU)
-  -- DAMP_TAU is auto-tuned from the measured ffmpeg startup latency so the
-  -- visual is ~95% settled exactly when ffmpeg crosses the readiness threshold.
-  -- (exp(-3) ≈ 0.05, so tau = MEASURED / 3.)
+  -- DAMP_TAU is auto-tuned from measured ffmpeg startup, but floored to 0.10s
+  -- so the orbit is always perceivable (300ms+ to settle). Without this floor,
+  -- a warm audio device makes ffmpeg start in 50ms and the orbit becomes
+  -- invisible — straight to pulsing red, no "wait" cue.
   local t0 = hs.timer.secondsSinceEpoch()
   local INITIAL_AMP = 3.5
   local FREQ        = 12.0
-  local DAMP_TAU    = MEASURED_STARTUP_SECS / 3.0
+  local DAMP_TAU    = math.max(MEASURED_STARTUP_SECS / 3.0, 0.10)
 
   warmupPulseTimer = hs.timer.doEvery(0.02, function()
     if not warmupIndicator then return end
@@ -381,16 +382,20 @@ local function startRec(asToggle)
      "-y", WAV})
   recordingTask:start()
 
-  -- Poll the WAV file size. The moment ffmpeg has written any real audio data
-  -- (file size > WAV-header-only), switch from warmup to red recording dot.
-  -- Timeout fallback is 2× the calibrated startup time (safety margin).
+  -- Transition to red recording dot when BOTH conditions are met:
+  --   (1) ffmpeg has actually written real audio bytes (mic is live), AND
+  --   (2) at least MIN_WARMUP elapsed (so the orbit is always perceivable).
+  -- Timeout fallback covers the case where polling can't tell (audio device
+  -- issue) — switch to red anyway so we don't get stuck.
   local pollStart = hs.timer.secondsSinceEpoch()
+  local MIN_WARMUP = 0.30  -- guarantees orbit visible long enough to read
   local timeoutSecs = math.max(MEASURED_STARTUP_SECS * 2.5, 0.8)
   warmupPoll = hs.timer.doEvery(0.03, function()
     local attr = hs.fs.attributes(WAV)
     local size = attr and attr.size or 0
     local elapsed = hs.timer.secondsSinceEpoch() - pollStart
-    if size > 100 or elapsed > timeoutSecs then
+    local audioReady = size > 100
+    if (audioReady and elapsed >= MIN_WARMUP) or elapsed > timeoutSecs then
       if warmupPoll then warmupPoll:stop(); warmupPoll = nil end
       hideWarmupIndicator()
       showRecordingIndicator(toggleMode)
