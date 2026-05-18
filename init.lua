@@ -221,6 +221,10 @@ startBackgroundRecorder = function()
   end, {
     "-f", "avfoundation", "-i", ":" .. devName,
     "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+    -- -flush_packets 1: flush to disk after every packet so that extractions
+    -- reading the file see the most recent audio (avoids stale-EOF where the
+    -- last 500ms of audio is still in ffmpeg's stdio buffer).
+    "-flush_packets", "1",
     "-t", tostring(BG_CYCLE_SECS),
     "-y", BUFFER_WAV
   })
@@ -298,8 +302,10 @@ local function stopRec(releaseEpoch)
   showTranscribingIndicator()
 
   local pressEpoch = fnPressEpoch
-  -- Schedule extraction (small delay so any in-flight buffer write completes)
-  pendingExtractTimer = hs.timer.doAfter(0.15, function()
+  -- Schedule extraction. 0.5s delay so the bg ffmpeg's stdio buffer has time
+  -- to flush the just-recorded audio to disk before our extraction reads it.
+  -- (Paired with -flush_packets 1 on the bg ffmpeg.)
+  pendingExtractTimer = hs.timer.doAfter(0.5, function()
     pendingExtractTimer = nil
     extractAndTranscribe(pressEpoch, releaseEpoch)
   end)
