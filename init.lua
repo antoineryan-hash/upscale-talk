@@ -258,9 +258,13 @@ local function extractAndTranscribe(pressEpoch, releaseEpoch)
 
   local snapshotPath = "/tmp/upscale-talk-" .. os.time() .. "-" .. math.random(1000, 9999) .. ".wav"
 
-  -- Use ffmpeg to extract the slice from the buffer (copy codec — no re-encode)
+  -- Use ffmpeg to extract the slice from the buffer.
+  -- -ignore_length 1: the buffer WAV is being actively written by another ffmpeg,
+  --   so its header length field is wrong (placeholder while file is open).
+  --   This flag tells ffmpeg to ignore the header length and read to EOF.
+  -- -acodec copy: no re-encode (PCM stays PCM)
   local extractCmd = string.format(
-    "%s -ss %.3f -t %.3f -i %q -acodec copy %q 2>/dev/null",
+    "%s -ignore_length 1 -ss %.3f -t %.3f -i %q -acodec copy %q 2>/dev/null",
     FFMPEG, startOffset, duration, BUFFER_WAV, snapshotPath
   )
 
