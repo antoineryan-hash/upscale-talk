@@ -325,15 +325,23 @@ local function startRec(asToggle)
 
   recordingTask = hs.task.new(FFMPEG, nil,
     {"-f", "avfoundation", "-i", ":" .. devName,
-     "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "-y", WAV})
+     "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+     -- -flush_packets 1: write each audio packet to disk immediately so the
+     -- warmup-poll sees the file grow as soon as the mic is live, instead of
+     -- waiting for ffmpeg's default 1+s output buffer to flush.
+     "-flush_packets", "1",
+     "-y", WAV})
   recordingTask:start()
 
-  -- Poll the WAV file size. The moment ffmpeg has written real audio data,
-  -- switch from the yellow ⏳ "wait" indicator to the red recording dot.
-  -- This is the user's "go ahead and speak" cue.
+  -- Poll the WAV file size. The moment ffmpeg has written any real audio data
+  -- (file size > WAV-header-only), switch from warmup to red recording dot.
+  -- Hard-cap the warmup at 1s so we never get stuck if polling can't tell.
+  local pollStart = hs.timer.secondsSinceEpoch()
   warmupPoll = hs.timer.doEvery(0.03, function()
     local attr = hs.fs.attributes(WAV)
-    if attr and attr.size > 1000 then  -- ~30 ms of audio = ffmpeg is genuinely capturing
+    local size = attr and attr.size or 0
+    local elapsed = hs.timer.secondsSinceEpoch() - pollStart
+    if size > 100 or elapsed > 1.0 then  -- > header bytes OR 1s fallback
       if warmupPoll then warmupPoll:stop(); warmupPoll = nil end
       hideWarmupIndicator()
       showRecordingIndicator(toggleMode)
