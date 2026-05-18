@@ -130,6 +130,43 @@ local function hideTranscribingIndicator()
   if transIndicator then transIndicator:delete(); transIndicator = nil end
 end
 
+-- ─── Warmup indicator (pulsing ⏳ hourglass — "DON'T speak yet") ─────────────
+-- Shown the instant fn is pressed, while ffmpeg is opening the audio device.
+-- Switches to the red recording dot the moment the WAV file actually has
+-- bytes (= ffmpeg has captured the first sample = mic is genuinely live).
+local warmupIndicator  = nil
+local warmupPulseTimer = nil
+local warmupPoll       = nil
+
+local function showWarmupIndicator()
+  if warmupIndicator then warmupIndicator:delete() end
+  if warmupPulseTimer then warmupPulseTimer:stop(); warmupPulseTimer = nil end
+
+  warmupIndicator = hs.canvas.new(indicatorFrame())
+  warmupIndicator:level(hs.canvas.windowLevels.overlay)
+  warmupIndicator:behavior({"canJoinAllSpaces", "stationary"})
+  warmupIndicator[1] = {
+    type          = "text",
+    text          = "⏳",
+    textSize      = 18,
+    textAlignment = "center",
+    frame         = {x = 0, y = 1, w = INDICATOR_SIZE, h = INDICATOR_SIZE},
+  }
+  warmupIndicator:show()
+
+  local t0 = hs.timer.secondsSinceEpoch()
+  warmupPulseTimer = hs.timer.doEvery(0.04, function()
+    if not warmupIndicator then return end
+    warmupIndicator:alpha(pulseAlpha(t0, 0.6, 0.4, 1.0))
+  end)
+end
+
+local function hideWarmupIndicator()
+  if warmupPulseTimer then warmupPulseTimer:stop(); warmupPulseTimer = nil end
+  if warmupIndicator then warmupIndicator:delete(); warmupIndicator = nil end
+  if warmupPoll then warmupPoll:stop(); warmupPoll = nil end
+end
+
 -- ─── Transcription history (menubar) ─────────────────────────────────────────
 local menubar = nil
 local recentTranscriptions = {}  -- [{time = "HH:MM:SS", text = "..."}]
@@ -240,6 +277,7 @@ local function stopRec()
   -- if the task was orphaned by a Hammerspoon restart), force-kill it via
   -- shell. Without this, ffmpeg keeps recording silence into the WAV forever.
   os.execute("pkill -9 -f 'ffmpeg.*upscale-talk' 2>/dev/null; true")
+  hideWarmupIndicator()
   hideRecordingIndicator()
   showTranscribingIndicator()
 
@@ -260,6 +298,9 @@ local function startRec(asToggle)
   toggleMode = asToggle and true or false
   os.remove(WAV)
 
+  -- Show "DON'T speak yet" indicator INSTANTLY (before ffmpeg even spawns)
+  showWarmupIndicator()
+
   local dev = hs.audiodevice.defaultInputDevice()
   local devName = dev and dev:name() or "MacBook Pro Microphone"
 
@@ -268,7 +309,17 @@ local function startRec(asToggle)
      "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "-y", WAV})
   recordingTask:start()
 
-  showRecordingIndicator(toggleMode)
+  -- Poll the WAV file size. The moment ffmpeg has written real audio data,
+  -- switch from the yellow ⏳ "wait" indicator to the red recording dot.
+  -- This is the user's "go ahead and speak" cue.
+  warmupPoll = hs.timer.doEvery(0.03, function()
+    local attr = hs.fs.attributes(WAV)
+    if attr and attr.size > 1000 then  -- ~30 ms of audio = ffmpeg is genuinely capturing
+      if warmupPoll then warmupPoll:stop(); warmupPoll = nil end
+      hideWarmupIndicator()
+      showRecordingIndicator(toggleMode)
+    end
+  end)
 
   if not toggleMode then
     releaseWatchdog = hs.timer.doEvery(0.03, function()
@@ -284,7 +335,12 @@ end
 local function promoteToToggle()
   toggleMode = true
   if releaseWatchdog then releaseWatchdog:stop(); releaseWatchdog = nil end
-  showRecordingIndicator(true)
+  -- If we're still in warmup when the double-tap arrives, the warmupPoll
+  -- will switch to red on its own. Otherwise we're already showing red and
+  -- need to re-render with the locked-mode ring.
+  if not warmupIndicator then
+    showRecordingIndicator(true)
+  end
 end
 
 -- ─── fn-key event tap ────────────────────────────────────────────────────────
