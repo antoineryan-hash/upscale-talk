@@ -25,51 +25,8 @@ local lastFnDownTime         = 0
 -- Ensure history dir exists at startup
 os.execute("mkdir -p " .. HISTORY_DIR)
 
--- ─── Auto-calibrate ffmpeg startup latency for this machine ──────────────────
--- The animation duration is tuned from this value so the visual "settles"
--- right when ffmpeg actually starts capturing — no fixed magic numbers, no
--- per-Mac tweaking needed.
-local MEASURED_STARTUP_SECS = 0.4  -- fallback default, replaced on first calibration
-
-local function calibrateStartup()
-  local testWav = "/tmp/upscale-talk-calibrate.wav"
-  os.remove(testWav)
-  local dev = hs.audiodevice.defaultInputDevice()
-  local devName = dev and dev:name() or "MacBook Pro Microphone"
-  local startEpoch = hs.timer.secondsSinceEpoch()
-  local task = hs.task.new("/opt/homebrew/bin/ffmpeg", function(_, _, _)
-    os.remove(testWav)
-  end, {
-    "-f", "avfoundation", "-i", ":" .. devName,
-    "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
-    "-flush_packets", "1",
-    "-t", "1.5",  -- only need a short test
-    "-y", testWav,
-  })
-  task:start()
-
-  -- Poll for first audio bytes, then record the latency
-  local poll
-  poll = hs.timer.doEvery(0.02, function()
-    local attr = hs.fs.attributes(testWav)
-    local size = attr and attr.size or 0
-    local elapsed = hs.timer.secondsSinceEpoch() - startEpoch
-    if size > 100 then
-      MEASURED_STARTUP_SECS = elapsed
-      print(string.format("[upscale-talk] calibrated ffmpeg startup: %.3fs", elapsed))
-      poll:stop()
-      task:terminate()
-    elseif elapsed > 3.0 then
-      -- Calibration failed (mic in use? permission missing?). Keep fallback.
-      print("[upscale-talk] calibration timeout — keeping default 0.4s")
-      poll:stop()
-      task:terminate()
-    end
-  end)
-end
-
--- Run calibration after Hammerspoon settles (don't fight startup)
-hs.timer.doAfter(2.0, calibrateStartup)
+-- (Calibration + warmup animation removed — simpler UX: red dot appears IFF
+-- ffmpeg is actually capturing. User waits for the dot to appear, then talks.)
 
 -- Kill any orphan ffmpeg processes left from a previous Hammerspoon session
 -- (cold-restart can detach our child ffmpeg, leaving it recording forever)
@@ -176,63 +133,12 @@ local function hideTranscribingIndicator()
   if transIndicator then transIndicator:delete(); transIndicator = nil end
 end
 
--- ─── Warmup indicator: solid red dot in damped circular orbit ────────────────
--- "Guitar string settling to rest" — shown the instant fn is pressed, while
--- ffmpeg is opening the audio device. The dot spins in a small orbit whose
--- radius exponentially decays. When the WAV file actually has bytes (ffmpeg
--- captured first sample = mic is live), the orbit ends and the regular
--- pulsing red recording indicator takes over.
-local warmupIndicator  = nil
-local warmupPulseTimer = nil
-local warmupPoll       = nil
+-- (Warmup indicator removed — see "ready-poll" in startRec instead. Nothing
+-- on screen between fn-press and ffmpeg-ready; the red dot is the signal.)
+local readyPoll = nil
 
-local function showWarmupIndicator()
-  if warmupIndicator then warmupIndicator:delete() end
-  if warmupPulseTimer then warmupPulseTimer:stop(); warmupPulseTimer = nil end
-
-  warmupIndicator = hs.canvas.new(indicatorFrame())
-  warmupIndicator:level(hs.canvas.windowLevels.overlay)
-  warmupIndicator:behavior({"canJoinAllSpaces", "stationary"})
-
-  local centerX = INDICATOR_SIZE / 2
-  local centerY = INDICATOR_SIZE / 2
-  local dotR    = INDICATOR_SIZE / 2 - 5  -- slightly smaller so orbit fits in frame
-
-  warmupIndicator[1] = {
-    type      = "circle",
-    action    = "fill",
-    fillColor = {red = RED.red, green = RED.green, blue = RED.blue, alpha = 1.0},
-    radius    = dotR,
-    center    = {x = centerX, y = centerY},
-  }
-  warmupIndicator:show()
-
-  -- Damped circular orbit: amp = INITIAL * exp(-t / TAU)
-  -- DAMP_TAU is auto-tuned from measured ffmpeg startup, but floored to 0.10s
-  -- so the orbit is always perceivable (300ms+ to settle). Without this floor,
-  -- a warm audio device makes ffmpeg start in 50ms and the orbit becomes
-  -- invisible — straight to pulsing red, no "wait" cue.
-  local t0 = hs.timer.secondsSinceEpoch()
-  local INITIAL_AMP = 3.5
-  local FREQ        = 12.0
-  local DAMP_TAU    = math.max(MEASURED_STARTUP_SECS / 3.0, 0.10)
-
-  warmupPulseTimer = hs.timer.doEvery(0.02, function()
-    if not warmupIndicator then return end
-    local elapsed = hs.timer.secondsSinceEpoch() - t0
-    local amp     = INITIAL_AMP * math.exp(-elapsed / DAMP_TAU)
-    local angle   = elapsed * FREQ * 2 * math.pi
-    warmupIndicator[1].center = {
-      x = centerX + amp * math.cos(angle),
-      y = centerY + amp * math.sin(angle),
-    }
-  end)
-end
-
-local function hideWarmupIndicator()
-  if warmupPulseTimer then warmupPulseTimer:stop(); warmupPulseTimer = nil end
-  if warmupIndicator then warmupIndicator:delete(); warmupIndicator = nil end
-  if warmupPoll then warmupPoll:stop(); warmupPoll = nil end
+local function cancelReadyPoll()
+  if readyPoll then readyPoll:stop(); readyPoll = nil end
 end
 
 -- ─── Transcription history (menubar) ─────────────────────────────────────────
@@ -345,7 +251,7 @@ local function stopRec()
   -- if the task was orphaned by a Hammerspoon restart), force-kill it via
   -- shell. Without this, ffmpeg keeps recording silence into the WAV forever.
   os.execute("pkill -9 -f 'ffmpeg.*upscale-talk' 2>/dev/null; true")
-  hideWarmupIndicator()
+  cancelReadyPoll()
   hideRecordingIndicator()
   showTranscribingIndicator()
 
@@ -366,8 +272,8 @@ local function startRec(asToggle)
   toggleMode = asToggle and true or false
   os.remove(WAV)
 
-  -- Show "DON'T speak yet" indicator INSTANTLY (before ffmpeg even spawns)
-  showWarmupIndicator()
+  -- No indicator yet — the red dot is the "you can speak now" signal.
+  -- Nothing on screen between fn-press and ffmpeg actually capturing audio.
 
   local dev = hs.audiodevice.defaultInputDevice()
   local devName = dev and dev:name() or "MacBook Pro Microphone"
@@ -375,29 +281,20 @@ local function startRec(asToggle)
   recordingTask = hs.task.new(FFMPEG, nil,
     {"-f", "avfoundation", "-i", ":" .. devName,
      "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
-     -- -flush_packets 1: write each audio packet to disk immediately so the
-     -- warmup-poll sees the file grow as soon as the mic is live, instead of
-     -- waiting for ffmpeg's default 1+s output buffer to flush.
-     "-flush_packets", "1",
+     "-flush_packets", "1",  -- flush each packet so the ready-poll can see growth
      "-y", WAV})
   recordingTask:start()
 
-  -- Transition to red recording dot when BOTH conditions are met:
-  --   (1) ffmpeg has actually written real audio bytes (mic is live), AND
-  --   (2) at least MIN_WARMUP elapsed (so the orbit is always perceivable).
-  -- Timeout fallback covers the case where polling can't tell (audio device
-  -- issue) — switch to red anyway so we don't get stuck.
+  -- Show the red recording dot the moment ffmpeg has actually written audio
+  -- (WAV file size > header bytes). Until then, nothing on screen.
+  -- 1.5s timeout fallback just in case polling can't tell.
   local pollStart = hs.timer.secondsSinceEpoch()
-  local MIN_WARMUP = 0.30  -- guarantees orbit visible long enough to read
-  local timeoutSecs = math.max(MEASURED_STARTUP_SECS * 2.5, 0.8)
-  warmupPoll = hs.timer.doEvery(0.03, function()
+  readyPoll = hs.timer.doEvery(0.03, function()
     local attr = hs.fs.attributes(WAV)
     local size = attr and attr.size or 0
     local elapsed = hs.timer.secondsSinceEpoch() - pollStart
-    local audioReady = size > 100
-    if (audioReady and elapsed >= MIN_WARMUP) or elapsed > timeoutSecs then
-      if warmupPoll then warmupPoll:stop(); warmupPoll = nil end
-      hideWarmupIndicator()
+    if size > 100 or elapsed > 1.5 then
+      cancelReadyPoll()
       showRecordingIndicator(toggleMode)
     end
   end)
@@ -416,10 +313,10 @@ end
 local function promoteToToggle()
   toggleMode = true
   if releaseWatchdog then releaseWatchdog:stop(); releaseWatchdog = nil end
-  -- If we're still in warmup when the double-tap arrives, the warmupPoll
-  -- will switch to red on its own. Otherwise we're already showing red and
-  -- need to re-render with the locked-mode ring.
-  if not warmupIndicator then
+  -- If the ready-poll is still running, it'll create the red dot in locked
+  -- mode on its own (it reads toggleMode). If the red dot is already up,
+  -- re-render to add the white ring.
+  if not readyPoll then
     showRecordingIndicator(true)
   end
 end
