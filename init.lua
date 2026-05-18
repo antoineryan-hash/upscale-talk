@@ -162,11 +162,13 @@ local function showWarmupIndicator()
   warmupIndicator:show()
 
   -- Damped circular orbit: amp = INITIAL * exp(-t / TAU)
-  -- INITIAL=4px, TAU=0.25s → amp at 250ms = 1.5px, at 500ms = 0.5px, at 750ms = 0.2px
+  -- Tuned so the dot is visually settled around ~250ms, while ffmpeg's actual
+  -- audio device opens around ~360ms — visual reads as "settled = ready" even
+  -- though there's a tiny tail. Faster, snappier, less "loading-screen" vibe.
   local t0 = hs.timer.secondsSinceEpoch()
-  local INITIAL_AMP = 4.0
-  local FREQ        = 9.0   -- revolutions per second (snappy guitar-string feel)
-  local DAMP_TAU    = 0.25  -- seconds
+  local INITIAL_AMP = 3.5
+  local FREQ        = 12.0  -- revolutions per second (fast, urgent settling)
+  local DAMP_TAU    = 0.10  -- seconds — at 250ms amp is ~8% of initial, looks still
 
   warmupPulseTimer = hs.timer.doEvery(0.02, function()
     if not warmupIndicator then return end
