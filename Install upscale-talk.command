@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Install upscale-talk — double-clickable from Finder.
+# Install upscale-talk - double-clickable from Finder.
 # https://github.com/antoineryan-hash/upscale-talk
 #
 set -euo pipefail
@@ -87,7 +87,7 @@ elif [ -f "$VOICEINK_MODEL" ]; then
   echo "  Reusing VoiceInk's existing model (saves 547 MB redownload)."
   cp "$VOICEINK_MODEL" "$OUR_MODEL"
 else
-  echo "  Downloading Whisper model (547 MB — about 1-2 minutes on a normal connection)..."
+  echo "  Downloading Whisper model (547 MB - about 1-2 minutes on a normal connection)..."
   curl -fL --progress-bar -o "$OUR_MODEL" "$MODEL_URL"
 fi
 

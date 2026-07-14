@@ -3,7 +3,7 @@
 **Free, local-only Whisper push-to-talk dictation for macOS.**
 Hold the **fn (Globe) key**, speak, release. Text pastes at your cursor in any app.
 
-Built for the UpScale team — replaces paid alternatives like VoiceInk Premium ($39) and Wispr Flow ($15/mo) with a single shell script + a 60-line Hammerspoon config. All processing happens on your Mac. Audio never leaves your machine.
+Built for the UpScale team. Replaces paid alternatives like VoiceInk Premium ($39) and Wispr Flow ($15/mo) with a single shell script + a 60-line Hammerspoon config. All processing happens on your Mac. Audio never leaves your machine.
 
 ## Requirements
 
@@ -14,9 +14,20 @@ Built for the UpScale team — replaces paid alternatives like VoiceInk Premium 
 
 ## Install
 
+**Easiest way - one line in Terminal.** Open Terminal (Cmd+Space, type
+"Terminal", Enter), paste this, press Enter, and follow the prompts:
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/antoineryan-hash/upscale-talk/main/install.sh | bash
 ```
+
+That's the whole install (about 5 minutes). Because it's fetched with curl,
+macOS does not show the "unverified developer" warning.
+
+**Prefer to double-click?** Grab the zip, unzip it, double-click
+**"Install upscale-talk.command"**. If your Mac blocks it with a malware
+warning, see "0 READ ME FIRST - if your Mac blocks the installer.txt" in the
+folder (the one-liner above avoids this entirely).
 
 The installer:
 1. Installs **Hammerspoon**, **whisper.cpp**, and **ffmpeg** via Homebrew
@@ -27,9 +38,9 @@ The installer:
 
 After the install runs, grant Hammerspoon three permissions in **System Settings → Privacy & Security**:
 
-- **Accessibility** — lets it paste at the cursor in any app
-- **Input Monitoring** — lets it listen for the fn key
-- **Microphone** — lets it record what you say
+- **Accessibility** - lets it paste at the cursor in any app
+- **Input Monitoring** - lets it listen for the fn key
+- **Microphone** - lets it record what you say
 
 Optional but recommended: **System Settings → Keyboard → Press 🌐 key to: Do Nothing** (prevents the emoji picker from briefly flashing on fn-press).
 
@@ -66,6 +77,13 @@ curl -fsSL https://raw.githubusercontent.com/antoineryan-hash/upscale-talk/main/
 This removes the Hammerspoon config block and the local Whisper model. It does NOT uninstall Hammerspoon, whisper.cpp, or ffmpeg (they may be used by other things on your Mac). Instructions to remove those are printed at the end of the uninstall.
 
 ## Troubleshooting
+
+**"Apple could not verify ... is free of malware" when opening the installer.**
+Normal for an unsigned script - nothing is wrong. Don't click "Move to Bin".
+See **"0 READ ME FIRST - if your Mac blocks the installer.txt"** in this folder.
+Short version: click Done, then System Settings > Privacy & Security > scroll
+to the bottom > "Open Anyway", then double-click the installer again. Or run it
+from Terminal: type `bash `, drag the .command file into the window, press Enter.
 
 **"Nothing happens when I hold fn."**
 Check that Hammerspoon is running (look for the hammer icon in the menu bar). Confirm Accessibility + Input Monitoring permissions are granted in System Settings → Privacy & Security.

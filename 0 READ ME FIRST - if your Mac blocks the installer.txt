@@ -1,0 +1,47 @@
+IF YOUR MAC BLOCKED THE INSTALLER
+("Apple could not verify 'Install upscale-talk.command' is free of malware")
+
+That warning is normal and nothing is wrong with your Mac. The installer
+is a plain script, not an App Store app, so your Mac has no way to check
+who wrote it and plays it safe. Do NOT click "Move to Bin".
+
+Pick ONE of the two fixes below.
+
+
+FIX 1 - the Settings way (no typing, about 30 seconds)
+
+  1. Double-click "Install upscale-talk.command". When the warning pops
+     up, click "Done" (NOT "Move to Bin").
+  2. Open System Settings, then click "Privacy & Security" in the sidebar.
+  3. Scroll to the bottom. You will see a line saying
+     "Install upscale-talk.command" was blocked.
+  4. Click "Open Anyway" next to it, and put in your Mac password.
+  5. Double-click the installer again. This time it opens and the
+     install runs in a Terminal window. Follow the prompts from there.
+
+  On older Macs (macOS 14 Sonoma or earlier) there is a shortcut:
+  right-click the installer, choose "Open", then click "Open" in the
+  popup. On newer Macs that shortcut no longer exists - use the steps
+  above.
+
+
+FIX 2 - the Terminal way (works on every Mac, about 20 seconds)
+
+  1. Press Cmd + Space, type: Terminal   and press Enter.
+  2. In the Terminal window type the word   bash   followed by a
+     single space. Do not press Enter yet.
+  3. Drag "Install upscale-talk.command" from this folder into the
+     Terminal window. The file's location fills itself in.
+  4. Press Enter. The installer starts right there in that window.
+
+
+WHY DOES THIS HAPPEN?
+
+Apple charges $99 a year for the developer certificate that makes this
+warning go away. upscale-talk is a free tool built for the UpScale team,
+so we skipped the certificate and kept it free.
+
+If you want to check the installer for yourself: right-click
+"Install upscale-talk.command", choose Open With > TextEdit. The whole
+thing is readable text - you can see exactly what it does before you
+run it.

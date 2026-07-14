@@ -4,6 +4,8 @@
 -- via the 🎤 menubar icon (click to copy to clipboard).
 -- Free, local-only Whisper push-to-talk dictation for macOS.
 -- https://github.com/antoineryan-hash/upscale-talk
+-- v0.5.1 - prefers the built-in mic over flaky Bluetooth, and refuses to
+--          paste "you" when a recording came back silent.
 
 local HOME    = os.getenv("HOME")
 local WAV     = "/tmp/upscale-talk.wav"
@@ -15,17 +17,31 @@ local HISTORY_DIR    = HOME .. "/upscale-talk/history"
 local HISTORY_MAX    = 20      -- entries shown in menubar
 local DOUBLE_TAP_WINDOW = 0.4
 
+-- ─── Behaviour flags (safe to change) ────────────────────────────────────────
+-- Bluetooth mics (AirPods etc.) frequently open via avfoundation but deliver a
+-- SILENT stream, which makes Whisper hallucinate the word "you" on every take.
+-- When the macOS default input is a Bluetooth device, record from the built-in
+-- mic instead - it captures reliably and won't drop your AirPods into the
+-- low-quality call profile. Set to false to always honour the macOS default.
+local PREFER_BUILTIN_OVER_BLUETOOTH = true
+
+-- If a recording comes back below this peak volume (dB), it's a dead capture -
+-- don't paste the garbage transcription, show an alert explaining why instead.
+-- Real speech peaks well above -70 dB; a silent avfoundation stream sits at -91.
+local SILENCE_MAX_DB = -70
+
 local recording              = false
 local toggleMode             = false
 local recordingTask          = nil
 local releaseWatchdog        = nil
 local pendingTranscribeTimer = nil
 local lastFnDownTime         = 0
+local currentDevName         = nil   -- the input device the live recording opened
 
 -- Ensure history dir exists at startup
 os.execute("mkdir -p " .. HISTORY_DIR)
 
--- (Calibration + warmup animation removed — simpler UX: red dot appears IFF
+-- (Calibration + warmup animation removed - simpler UX: red dot appears IFF
 -- ffmpeg is actually capturing. User waits for the dot to appear, then talks.)
 
 -- Kill any orphan ffmpeg processes left from a previous Hammerspoon session
@@ -133,7 +149,7 @@ local function hideTranscribingIndicator()
   if transIndicator then transIndicator:delete(); transIndicator = nil end
 end
 
--- (Warmup indicator removed — see "ready-poll" in startRec instead. Nothing
+-- (Warmup indicator removed - see "ready-poll" in startRec instead. Nothing
 -- on screen between fn-press and ffmpeg-ready; the red dot is the signal.)
 local readyPoll = nil
 
@@ -149,7 +165,7 @@ local function refreshMenubar()
   if not menubar then return end
   local menu = {}
   if #recentTranscriptions == 0 then
-    table.insert(menu, {title = "No transcriptions yet — hold fn to dictate", disabled = true})
+    table.insert(menu, {title = "No transcriptions yet - hold fn to dictate", disabled = true})
   else
     table.insert(menu, {title = "Recent transcriptions (click to copy)", disabled = true})
     table.insert(menu, {title = "-"})
@@ -213,7 +229,7 @@ local function transcribeAndPaste(wavPath)
     local text = (stdOut or ""):gsub("^%s+", ""):gsub("%s+$", "")
     if #text == 0 then return end
 
-    -- Save to history FIRST — so even if the paste lands in the wrong window,
+    -- Save to history FIRST - so even if the paste lands in the wrong window,
     -- the transcription is recoverable from the menubar / history folder.
     saveToHistory(text)
 
@@ -226,6 +242,38 @@ local function transcribeAndPaste(wavPath)
     end)
   end, {"-m", MODEL, "-f", wavPath, "-nt", "-np"})
   task:start()
+end
+
+-- Measure the peak volume of a WAV (async, ~150ms). Calls cb(maxDb) with a
+-- number like -9.7, or nil if it couldn't be parsed. ffmpeg's volumedetect
+-- prints "max_volume: -NN.N dB" to stderr.
+local function measureMaxDb(wavPath, cb)
+  local t = hs.task.new(FFMPEG, function(_exit, _out, stdErr)
+    local maxDb = tonumber((stdErr or ""):match("max_volume:%s*(-?%d+%.?%d*) dB"))
+    cb(maxDb)
+  end, {"-i", wavPath, "-af", "volumedetect", "-f", "null", "-"})
+  t:start()
+end
+
+-- The recording was silent. Don't paste "you" garbage - tell the user what
+-- happened and how to fix it, tailored to whether the dead device was
+-- Bluetooth or the built-in mic.
+local function showSilenceAlert(devName)
+  hs.alert.closeAll()
+  local shown = devName or "your microphone"
+  local msg = "🔇 No audio captured\n\n\"" .. shown .. "\" delivered silence."
+  local lname = shown:lower()
+  if lname:find("airpod") or lname:find("blue") or lname:find("buds")
+     or lname:find("beats") or lname:find("headphone") then
+    msg = msg .. "\nBluetooth mics often fail for recording.\n"
+              .. "Fix: System Settings > Sound > Input,\n"
+              .. "pick MacBook Pro Microphone, then try again."
+  else
+    msg = msg .. "\nCheck the mic isn't muted, and that\n"
+              .. "Hammerspoon has Microphone permission\n"
+              .. "(System Settings > Privacy > Microphone)."
+  end
+  hs.alert.show(msg, { textSize = 16 }, 7)
 end
 
 local function cancelPendingTranscribe()
@@ -256,14 +304,56 @@ local function stopRec()
   showTranscribingIndicator()
 
   local snapshotPath = "/tmp/upscale-talk-" .. os.time() .. "-" .. math.random(1000, 9999) .. ".wav"
+  local devUsed = currentDevName
   pendingTranscribeTimer = hs.timer.doAfter(0.3, function()
     pendingTranscribeTimer = nil
     os.execute(string.format("mv %q %q 2>/dev/null", WAV, snapshotPath))
-    transcribeAndPaste(snapshotPath)
-    -- Keep WAVs around for 5 minutes (was 10s) — enough buffer to re-transcribe
+    -- Guard against dead/silent captures (Bluetooth avfoundation failures, a
+    -- muted mic, revoked permission). Measure the peak first; only transcribe
+    -- if there's real signal - otherwise alert instead of pasting "you".
+    measureMaxDb(snapshotPath, function(maxDb)
+      if maxDb ~= nil and maxDb < SILENCE_MAX_DB then
+        hideTranscribingIndicator()
+        showSilenceAlert(devUsed)
+      else
+        transcribeAndPaste(snapshotPath)
+      end
+    end)
+    -- Keep WAVs around for 5 minutes (was 10s) - enough buffer to re-transcribe
     -- if something goes wrong, but bounded so /tmp doesn't fill up
     hs.timer.doAfter(300, function() os.remove(snapshotPath) end)
   end)
+end
+
+-- Pick which input device ffmpeg should open. Honours the macOS default input,
+-- except when that default is a Bluetooth device and PREFER_BUILTIN_OVER_BLUETOOTH
+-- is on - then redirect to the built-in mic (avfoundation captures it reliably).
+local function looksBluetooth(dev)
+  if not dev then return false end
+  local t = dev.transportType and dev:transportType() or ""
+  if type(t) == "string" and t:lower():find("blue") then return true end
+  local n = (dev:name() or ""):lower()
+  return n:find("airpod") ~= nil or n:find("buds") ~= nil or n:find("beats") ~= nil
+      or n:find("headphone") ~= nil or n:find("wh%-") ~= nil or n:find("wf%-") ~= nil
+end
+
+local function looksBuiltin(dev)
+  if not dev then return false end
+  local t = dev.transportType and dev:transportType() or ""
+  if type(t) == "string" and t:lower():find("built") then return true end
+  local n = (dev:name() or ""):lower()
+  return n:find("macbook") ~= nil and n:find("microphone") ~= nil
+end
+
+local function chooseInputDevice()
+  local dev = hs.audiodevice.defaultInputDevice()
+  local name = dev and dev:name() or "MacBook Pro Microphone"
+  if PREFER_BUILTIN_OVER_BLUETOOTH and looksBluetooth(dev) then
+    for _, d in ipairs(hs.audiodevice.allInputDevices()) do
+      if looksBuiltin(d) then return d:name() end
+    end
+  end
+  return name
 end
 
 local function startRec(asToggle)
@@ -272,11 +362,11 @@ local function startRec(asToggle)
   toggleMode = asToggle and true or false
   os.remove(WAV)
 
-  -- No indicator yet — the red dot is the "you can speak now" signal.
+  -- No indicator yet - the red dot is the "you can speak now" signal.
   -- Nothing on screen between fn-press and ffmpeg actually capturing audio.
 
-  local dev = hs.audiodevice.defaultInputDevice()
-  local devName = dev and dev:name() or "MacBook Pro Microphone"
+  local devName = chooseInputDevice()
+  currentDevName = devName
 
   recordingTask = hs.task.new(FFMPEG, nil,
     {"-f", "avfoundation", "-i", ":" .. devName,
@@ -367,9 +457,9 @@ fnTap:start()
 menubar = hs.menubar.new()
 if menubar then
   menubar:setTitle("🎤")
-  menubar:setTooltip("upscale-talk — recent transcriptions")
+  menubar:setTooltip("upscale-talk - recent transcriptions")
   loadHistoryFromDisk()
   refreshMenubar()
 end
 
-hs.alert.show("upscale-talk ready — hold fn to dictate, double-tap fn to lock on", 2.0)
+hs.alert.show("upscale-talk ready - hold fn to dictate, double-tap fn to lock on", 2.0)
