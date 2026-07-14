@@ -52,10 +52,21 @@ I can install it for you right now. Two things to expect:
     type it - that's normal. Type it and press Enter.
 
 NOBREW
-  printf "Install Homebrew now? [y/N] "
+  printf "Install Homebrew now? [Y/n] "
   read -r reply
   case "$reply" in
-    [yY]*)
+    [nN]*)
+      cat <<'SKIP'
+
+No problem. Install Homebrew yourself by pasting this line into Terminal,
+following its prompts, then run this installer again:
+
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+SKIP
+      echo "Press Enter to close..."; read -r; exit 1
+      ;;
+    *)
       echo ""
       echo "→ Installing Homebrew (this is the slow part - good time for a coffee)..."
       if ! NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"; then
@@ -68,17 +79,6 @@ NOBREW
         grep -q 'brew shellenv' "$HOME/.zprofile" 2>/dev/null || \
           printf '\neval "$(/opt/homebrew/bin/brew shellenv)"\n' >> "$HOME/.zprofile"
       fi
-      ;;
-    *)
-      cat <<'SKIP'
-
-No problem. Install Homebrew yourself by pasting this line into Terminal,
-following its prompts, then run this installer again:
-
-  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-
-SKIP
-      echo "Press Enter to close..."; read -r; exit 1
       ;;
   esac
 fi
@@ -114,9 +114,9 @@ read -r
 # ─── 1. Homebrew dependencies ────────────────────────────────────────────────
 echo ""
 echo "→ Step 2/7: Installing Homebrew dependencies (Hammerspoon, whisper.cpp, ffmpeg)..."
-brew list --cask hammerspoon >/dev/null 2>&1 || brew install --cask hammerspoon
-brew list whisper-cpp        >/dev/null 2>&1 || brew install whisper-cpp
-brew list ffmpeg             >/dev/null 2>&1 || brew install ffmpeg
+brew list --cask hammerspoon >/dev/null 2>&1 || brew install --cask hammerspoon </dev/null
+brew list whisper-cpp        >/dev/null 2>&1 || brew install whisper-cpp </dev/null
+brew list ffmpeg             >/dev/null 2>&1 || brew install ffmpeg </dev/null
 
 # ─── 2. Set up directories + Whisper model ───────────────────────────────────
 echo ""

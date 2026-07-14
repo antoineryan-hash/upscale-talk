@@ -18,11 +18,15 @@ Built for the UpScale team. Replaces paid alternatives like VoiceInk Premium ($3
 "Terminal", Enter), paste this, press Enter, and follow the prompts:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/antoineryan-hash/upscale-talk/main/install.sh | bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/antoineryan-hash/upscale-talk/main/install.sh)"
 ```
 
-That's the whole install (about 5 minutes). Because it's fetched with curl,
-macOS does not show the "unverified developer" warning.
+That's the whole install (about 5 minutes). If you don't have Homebrew yet, it
+offers to install that for you first. Because it's fetched with curl, macOS does
+not show the "unverified developer" warning.
+
+(Use `bash -c "$(curl ...)"`, not `curl ... | bash` - the pipe form can truncate
+partway through because Homebrew reads from the same input stream.)
 
 **Prefer to double-click?** Grab the zip, unzip it, double-click
 **"Install upscale-talk.command"**. If your Mac blocks it with a malware
@@ -71,7 +75,7 @@ No cloud APIs. No subscriptions. No telemetry.
 ## Uninstall
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/antoineryan-hash/upscale-talk/main/uninstall.sh | bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/antoineryan-hash/upscale-talk/main/uninstall.sh)"
 ```
 
 This removes the Hammerspoon config block and the local Whisper model. It does NOT uninstall Hammerspoon, whisper.cpp, or ffmpeg (they may be used by other things on your Mac). Instructions to remove those are printed at the end of the uninstall.

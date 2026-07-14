@@ -2,7 +2,13 @@
 #
 # upscale-talk one-line installer.
 # Run it with:
-#   curl -fsSL https://raw.githubusercontent.com/antoineryan-hash/upscale-talk/main/install.sh | bash
+#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/antoineryan-hash/upscale-talk/main/install.sh)"
+#
+# NOTE: use `bash -c "$(curl ...)"`, NOT `curl ... | bash`. Piping into bash
+# makes the script share stdin with the programs it runs (Homebrew), and brew's
+# installers read stdin and swallow the rest of the script - the install then
+# truncates partway. Passing the script as an argument keeps stdin on the
+# terminal, so it survives. (Same reason Homebrew ships its installer this way.)
 #
 # Because this is fetched with curl (not opened from Finder), macOS does NOT
 # quarantine it, so there is no "unverified developer" warning to fight.
@@ -65,10 +71,21 @@ I can install it for you right now. Two things to expect:
     type it - that's normal. Type it and press Enter.
 
 NOBREW
-  printf "Install Homebrew now? [y/N] "
+  printf "Install Homebrew now? [Y/n] "
   read -r reply </dev/tty
   case "$reply" in
-    [yY]*)
+    [nN]*)
+      cat <<'SKIP'
+
+No problem. Install Homebrew yourself by pasting this line, following its
+prompts, then run the upscale-talk line again:
+
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+SKIP
+      exit 1
+      ;;
+    *)
       echo ""
       echo "→ Installing Homebrew (this is the slow part - good time for a coffee)..."
       if ! NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/tty; then
@@ -82,17 +99,6 @@ NOBREW
         grep -q 'brew shellenv' "$HOME/.zprofile" 2>/dev/null || \
           printf '\neval "$(/opt/homebrew/bin/brew shellenv)"\n' >> "$HOME/.zprofile"
       fi
-      ;;
-    *)
-      cat <<'SKIP'
-
-No problem. Install Homebrew yourself by pasting this line, following its
-prompts, then re-running the upscale-talk line:
-
-  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-
-SKIP
-      exit 1
       ;;
   esac
 fi
@@ -128,9 +134,9 @@ ask
 # ─── 2. Homebrew dependencies ────────────────────────────────────────────────
 echo ""
 echo "→ Step 2/7: Installing Homebrew dependencies (Hammerspoon, whisper.cpp, ffmpeg)..."
-brew list --cask hammerspoon >/dev/null 2>&1 || brew install --cask hammerspoon
-brew list whisper-cpp        >/dev/null 2>&1 || brew install whisper-cpp
-brew list ffmpeg             >/dev/null 2>&1 || brew install ffmpeg
+brew list --cask hammerspoon >/dev/null 2>&1 || brew install --cask hammerspoon </dev/null
+brew list whisper-cpp        >/dev/null 2>&1 || brew install whisper-cpp </dev/null
+brew list ffmpeg             >/dev/null 2>&1 || brew install ffmpeg </dev/null
 
 # ─── 3. Set up directories + Whisper model ───────────────────────────────────
 echo ""
@@ -328,7 +334,7 @@ If something stops working:
     re-open it from /Applications/Hammerspoon.app.
 
 Want to remove it later? Paste this in Terminal:
-  curl -fsSL https://raw.githubusercontent.com/antoineryan-hash/upscale-talk/main/uninstall.sh | bash
+  bash -c "$(curl -fsSL https://raw.githubusercontent.com/antoineryan-hash/upscale-talk/main/uninstall.sh)"
 
 You can close this window now.
 ──────────────────────────────────────────────────────────────────
