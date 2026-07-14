@@ -28,6 +28,66 @@ About 5 minutes total. Press Enter to begin.
 BANNER
 read -r
 
+# ─── Prerequisites (Apple Silicon + Homebrew) ────────────────────────────────
+if [[ "$(uname -m)" != "arm64" ]]; then
+  echo "❌ This tool requires an Apple Silicon Mac (M1 or newer). Detected: $(uname -m)."
+  echo "   It won't run on Intel Macs. Nothing was installed."
+  echo "Press Enter to close..."; read -r; exit 1
+fi
+
+command -v brew >/dev/null 2>&1 || { [ -x /opt/homebrew/bin/brew ] && eval "$(/opt/homebrew/bin/brew shellenv)"; }
+
+if ! command -v brew >/dev/null 2>&1; then
+  cat <<'NOBREW'
+
+→ First: Homebrew (required, and not installed yet)
+
+upscale-talk installs its three parts (Hammerspoon, whisper.cpp, ffmpeg) using
+Homebrew - Apple's standard, free package manager. Your Mac doesn't have it yet.
+
+I can install it for you right now. Two things to expect:
+  - It downloads Apple's Command Line Tools. On a fresh Mac this can take
+    5-20 minutes depending on your internet. Just let it run.
+  - It asks for your Mac login password once. You won't see characters as you
+    type it - that's normal. Type it and press Enter.
+
+NOBREW
+  printf "Install Homebrew now? [y/N] "
+  read -r reply
+  case "$reply" in
+    [yY]*)
+      echo ""
+      echo "→ Installing Homebrew (this is the slow part - good time for a coffee)..."
+      if ! NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"; then
+        echo ""
+        echo "❌ Homebrew install didn't finish. Check your internet and run this installer again."
+        echo "Press Enter to close..."; read -r; exit 1
+      fi
+      if [ -x /opt/homebrew/bin/brew ]; then
+        eval "$(/opt/homebrew/bin/brew shellenv)"
+        grep -q 'brew shellenv' "$HOME/.zprofile" 2>/dev/null || \
+          printf '\neval "$(/opt/homebrew/bin/brew shellenv)"\n' >> "$HOME/.zprofile"
+      fi
+      ;;
+    *)
+      cat <<'SKIP'
+
+No problem. Install Homebrew yourself by pasting this line into Terminal,
+following its prompts, then run this installer again:
+
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+SKIP
+      echo "Press Enter to close..."; read -r; exit 1
+      ;;
+  esac
+fi
+
+if ! command -v brew >/dev/null 2>&1; then
+  echo "❌ Homebrew still isn't on PATH. Quit Terminal, open a fresh window, and run this installer again."
+  echo "Press Enter to close..."; read -r; exit 1
+fi
+
 # ─── 0. Pre-flight conflict check (Voice Control + Hey Siri) ─────────────────
 cat <<'PREFLIGHT'
 
@@ -50,20 +110,6 @@ waveform icon OR Siri "actively listening," one of those is on.
 Press Enter once both are off (or you've confirmed they were already off).
 PREFLIGHT
 read -r
-
-# ─── Prerequisites ───────────────────────────────────────────────────────────
-if ! command -v brew >/dev/null 2>&1; then
-  echo "❌ Homebrew not found. Install from https://brew.sh first, then re-run this script."
-  echo "Press Enter to close..."
-  read -r
-  exit 1
-fi
-if [[ "$(uname -m)" != "arm64" ]]; then
-  echo "❌ This tool requires Apple Silicon (M1+). Detected arch: $(uname -m)."
-  echo "Press Enter to close..."
-  read -r
-  exit 1
-fi
 
 # ─── 1. Homebrew dependencies ────────────────────────────────────────────────
 echo ""
