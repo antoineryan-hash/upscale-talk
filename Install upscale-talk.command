@@ -171,6 +171,32 @@ defaults write com.apple.HIToolbox AppleFnUsageType -int 0
 killall -HUP cfprefsd 2>/dev/null || true
 echo "  Done. (Reversible: 'defaults delete com.apple.HIToolbox AppleDictationAutoEnable' and 'defaults delete com.apple.HIToolbox AppleFnUsageType')"
 
+# ─── 5b. Usage sharing (opt-in, counts only) ─────────────────────────────────
+cat <<'USAGE'
+
+→ Usage sharing (optional)
+
+upscale-talk can send a daily COUNT of how many words you dictate, tagged with
+your first name - so the team can see how much it's actually used. It NEVER
+sends your text, your audio, or anything you said. Just numbers.
+
+You can turn this off any time (edit ~/upscale-talk/telemetry.conf).
+
+USAGE
+printf "Share your daily word count? [Y/n] "
+read -r share
+if [[ "$share" =~ ^[Nn] ]]; then
+  printf 'enabled=false\n' > ~/upscale-talk/telemetry.conf
+  echo "  No problem - nothing will be shared."
+else
+  printf "  Your first name (for the report): "
+  read -r ut_name
+  ut_name=$(printf '%s' "$ut_name" | tr -cd '[:alnum:] _-' | cut -c1-40)
+  [ -z "$ut_name" ] && ut_name="anon-$(hostname -s 2>/dev/null | tr -cd '[:alnum:]' | cut -c1-12)"
+  printf 'name=%s\nenabled=true\n' "$ut_name" > ~/upscale-talk/telemetry.conf
+  echo "  Thanks - sharing word counts as \"$ut_name\" (counts only, never your text)."
+fi
+
 # ─── 6. Launch Hammerspoon + walk through permissions ────────────────────────
 echo ""
 echo "→ Step 6/7: Launching the engine and walking through 3 macOS permissions..."
@@ -289,8 +315,11 @@ What's normal that might surprise you:
   • First press after 5+ min idle: a couple hundred ms before the red dot
     appears. This is the audio device cold-start. After that, near-instant.
   • If you talk BEFORE the red dot, the first word gets cut. Wait for the dot.
-  • Privacy: audio never leaves your Mac. No cloud, no API, no telemetry.
-    The Whisper model runs on-device.
+  • Privacy: your audio and your text never leave your Mac - the Whisper model
+    runs on-device, no cloud, no API. The ONLY thing that can leave (and only if
+    you opted in above) is a daily word COUNT tagged with your first name -
+    never a single word of what you actually said. Turn it off any time in
+    ~/upscale-talk/telemetry.conf.
 
 If something stops working:
   • Click the 🔨 hammer icon in your menu bar > Reload Config.

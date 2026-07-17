@@ -70,7 +70,16 @@ A small `🎤` appears while recording. A `⏳` appears while transcribing. Then
 | Transcription | `whisper-cli` (whisper.cpp) running the Q5_0 large-v3-turbo model locally |
 | Paste | AppleScript Cmd+V via Hammerspoon, with clipboard restoration |
 
-No cloud APIs. No subscriptions. No telemetry.
+No cloud APIs. No subscriptions. Your audio and transcribed text never leave
+your Mac.
+
+## Usage sharing (opt-in, counts only)
+
+At install you're asked whether to share a daily **word count** (tagged with a
+first name) so the team can measure how much the tool gets used. It's **off
+unless you say yes**, and it sends **only numbers** - never your audio, never a
+word of your text. It reads `~/upscale-talk/telemetry.conf`; set `enabled=false`
+there (or delete the file) and reload Hammerspoon to stop sharing.
 
 ## Uninstall
 

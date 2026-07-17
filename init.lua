@@ -4,9 +4,11 @@
 -- via the 🎤 menubar icon (click to copy to clipboard).
 -- Free, local-only Whisper push-to-talk dictation for macOS.
 -- https://github.com/antoineryan-hash/upscale-talk
--- v0.5.1 - prefers the built-in mic over flaky Bluetooth, and refuses to
---          paste "you" when a recording came back silent.
+-- v0.5.5 - prefers the built-in mic over flaky Bluetooth; refuses to paste "you"
+--          on a silent capture; optional opt-in usage counts (word totals only,
+--          never your text - see the telemetry section below).
 
+local VERSION = "0.5.5"
 local HOME    = os.getenv("HOME")
 local WAV     = "/tmp/upscale-talk.wav"
 local MODEL   = HOME .. "/upscale-talk/models/ggml-large-v3-turbo-q5_0.bin"
@@ -29,6 +31,33 @@ local PREFER_BUILTIN_OVER_BLUETOOTH = true
 -- don't paste the garbage transcription, show an alert explaining why instead.
 -- Real speech peaks well above -70 dB; a silent avfoundation stream sits at -91.
 local SILENCE_MAX_DB = -70
+
+-- ─── Usage telemetry (OPT-IN, counts only, never your text) ──────────────────
+-- If (and only if) you opted in during install, this sends a daily COUNT of how
+-- many words you dictated - tagged with the first name you gave - so the team
+-- can measure how useful the tool is. It NEVER sends any transcribed text, any
+-- audio, or anything you said. Reads ~/upscale-talk/telemetry.conf:
+--     name=<your first name>
+--     enabled=true|false
+-- No config file, or enabled=false -> nothing is ever sent. To stop sharing at
+-- any time: set enabled=false in that file (or delete it) and reload Hammerspoon.
+local TELEMETRY_ENDPOINT = "TELEMETRY_ENDPOINT_URL"  -- baked in at release once the Sheet endpoint is deployed
+local TELEMETRY_TOKEN    = "upscale-talk-usage-v1"
+local TELEMETRY_ENABLED  = false
+local TELEMETRY_NAME     = "unknown"
+do
+  local f = io.open(HOME .. "/upscale-talk/telemetry.conf", "r")
+  if f then
+    for line in f:lines() do
+      local k, v = line:match("^(%w+)%s*=%s*(.-)%s*$")
+      if k == "enabled" then TELEMETRY_ENABLED = (v == "true") end
+      if k == "name" and v and #v > 0 then
+        TELEMETRY_NAME = v:gsub('[^%w _%-]', ''):sub(1, 40)  -- sanitise for safe JSON
+      end
+    end
+    f:close()
+  end
+end
 
 local recording              = false
 local toggleMode             = false
@@ -409,6 +438,55 @@ local function promoteToToggle()
   if not readyPoll then
     showRecordingIndicator(true)
   end
+end
+
+-- ─── Usage reporting (opt-in; counts only) ───────────────────────────────────
+-- Computes per-day {words, takes} for the last 14 days straight from the history
+-- filenames/contents and POSTs them. No content ever leaves the machine. The
+-- server keeps one row per (name, date) and overwrites it, so re-sending the
+-- same window is harmless and any day the laptop was off gets backfilled the
+-- next time it's on. Nothing here fires unless TELEMETRY_ENABLED is true.
+local function reportUsage()
+  if not TELEMETRY_ENABLED then return end
+  if TELEMETRY_ENDPOINT == "TELEMETRY_" .. "ENDPOINT_URL" then return end  -- not yet wired at release
+
+  -- Sum words + count takes per day over the last 14 days. Uses a numeric date
+  -- comparison (portable across zsh/bash/sh - hs.execute runs the user's shell,
+  -- which is zsh by default, where `[ "$a" \< "$b" ]` is NOT valid).
+  local counter = [[
+    H="$HOME/upscale-talk/history"
+    cut=$(date -v-14d +%Y%m%d 2>/dev/null) || exit 0
+    for f in "$H"/*.txt; do
+      [ -e "$f" ] || continue
+      b=$(basename "$f" .txt); d=${b%%_*}; dn=$(echo "$d" | tr -d '-')
+      [ "$dn" -ge "$cut" ] 2>/dev/null || continue
+      w=$(wc -w < "$f" 2>/dev/null | tr -d ' ')
+      echo "$d ${w:-0}"
+    done | awk '{words[$1]+=$2; takes[$1]++} END {for (d in words) printf "%s %d %d\n", d, words[d], takes[d]}'
+  ]]
+  local out = hs.execute(counter, true)  -- true = load the user's shell env
+
+  local days = {}
+  for line in (out or ""):gmatch("[^\n]+") do
+    local d, w, t = line:match("(%d%d%d%d%-%d%d%-%d%d)%s+(%d+)%s+(%d+)")
+    if d then
+      days[#days + 1] = string.format('{"date":"%s","words":%s,"takes":%s}', d, w, t)
+    end
+  end
+  if #days == 0 then return end
+
+  local payload = string.format(
+    '{"token":"%s","name":"%s","tool_version":"%s","days":[%s]}',
+    TELEMETRY_TOKEN, TELEMETRY_NAME, VERSION, table.concat(days, ","))
+
+  hs.http.asyncPost(TELEMETRY_ENDPOINT, payload,
+    {["Content-Type"] = "application/json"},
+    function(_status, _body, _headers) end)  -- fire and forget
+end
+
+if TELEMETRY_ENABLED then
+  hs.timer.doAfter(20, reportUsage)             -- once, shortly after load/reload
+  hs.timer.doEvery(6 * 60 * 60, reportUsage)    -- and every 6 hours while running
 end
 
 -- ─── fn-key event tap ────────────────────────────────────────────────────────
