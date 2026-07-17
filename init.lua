@@ -450,28 +450,35 @@ local function reportUsage()
   if not TELEMETRY_ENABLED then return end
   if TELEMETRY_ENDPOINT == "TELEMETRY_" .. "ENDPOINT_URL" then return end  -- not yet wired at release
 
-  -- Sum words + count takes per day over the last 14 days. Uses a numeric date
-  -- comparison (portable across zsh/bash/sh - hs.execute runs the user's shell,
-  -- which is zsh by default, where `[ "$a" \< "$b" ]` is NOT valid).
-  local counter = [[
-    H="$HOME/upscale-talk/history"
-    cut=$(date -v-14d +%Y%m%d 2>/dev/null) || exit 0
-    for f in "$H"/*.txt; do
-      [ -e "$f" ] || continue
-      b=$(basename "$f" .txt); d=${b%%_*}; dn=$(echo "$d" | tr -d '-')
-      [ "$dn" -ge "$cut" ] 2>/dev/null || continue
-      w=$(wc -w < "$f" 2>/dev/null | tr -d ' ')
-      echo "$d ${w:-0}"
-    done | awk '{words[$1]+=$2; takes[$1]++} END {for (d in words) printf "%s %d %d\n", d, words[d], takes[d]}'
-  ]]
-  local out = hs.execute(counter, true)  -- true = load the user's shell env
+  -- Count words + takes per day over the last 14 days, in PURE LUA - no shell.
+  -- (hs.execute's login shell runs multi-line pipelines unreliably across the
+  -- varied shell setups on colleagues' Macs; reading the files directly is
+  -- deterministic everywhere.)
+  local cutoff = os.date("%Y%m%d", os.time() - 14 * 24 * 3600)  -- 14 days ago, YYYYMMDD
+  local perDay = {}   -- ["YYYY-MM-DD"] = {words=, takes=}
+  local ok = pcall(function()
+    for file in hs.fs.dir(HISTORY_DIR) do
+      local date = file:match("^(%d%d%d%d%-%d%d%-%d%d).*%.txt$")
+      if date and (date:gsub("%-", "") >= cutoff) then
+        local fh = io.open(HISTORY_DIR .. "/" .. file, "r")
+        if fh then
+          local text = fh:read("*a") or ""
+          fh:close()
+          local wc = 0
+          for _ in text:gmatch("%S+") do wc = wc + 1 end
+          local r = perDay[date] or { words = 0, takes = 0 }
+          r.words = r.words + wc
+          r.takes = r.takes + 1
+          perDay[date] = r
+        end
+      end
+    end
+  end)
+  if not ok then return end
 
   local days = {}
-  for line in (out or ""):gmatch("[^\n]+") do
-    local d, w, t = line:match("(%d%d%d%d%-%d%d%-%d%d)%s+(%d+)%s+(%d+)")
-    if d then
-      days[#days + 1] = string.format('{"date":"%s","words":%s,"takes":%s}', d, w, t)
-    end
+  for date, r in pairs(perDay) do
+    days[#days + 1] = string.format('{"date":"%s","words":%d,"takes":%d}', date, r.words, r.takes)
   end
   if #days == 0 then return end
 
