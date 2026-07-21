@@ -79,7 +79,10 @@ def main():
 
     md = args.meeting_dir
     tj = os.path.join(md, "transcript.json")
-    them_wav = os.path.join(md, "them.wav")
+    # Snippet source: the far side (remote), the mono mix (dual-mic), or the mic
+    # (single-mic in-person) — whichever this meeting produced.
+    them_wav = next((os.path.join(md, c) for c in ("them.wav", "mix.wav", "me.wav")
+                     if os.path.exists(os.path.join(md, c))), os.path.join(md, "them.wav"))
     if not os.path.exists(tj):
         sys.exit(f"no transcript.json in {md} — run meeting_transcribe.py first")
     segments = json.load(open(tj))

@@ -624,10 +624,15 @@ local function startMeeting()
   meetingTapTask:start()
 
   -- Your mic — honour the current default input (headset), don't force built-in.
+  -- Capture 2 channels: a 2-mic device (e.g. Rode, one lav per person) lands each
+  -- person on their own channel for clean diarisation; a mono mic just duplicates
+  -- (the pipeline detects that and falls back). ffmpeg errors if the device has
+  -- fewer channels than asked, so probe channel support isn't needed: avfoundation
+  -- upmixes a mono source to the requested 2 channels.
   local mic = meetingMicDevice()
   meetingMicTask = hs.task.new(FFMPEG, nil,
     {"-f", "avfoundation", "-i", ":" .. mic,
-     "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "-y", meetingDir .. "/me.wav"})
+     "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "2", "-y", meetingDir .. "/me.wav"})
   meetingMicTask:start()
 
   showMeetingIndicator()

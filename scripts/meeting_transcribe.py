@@ -159,29 +159,104 @@ def copy_to_downloads(meeting_dir):
     return dst
 
 
-def transcribe_me(meeting_dir, me_name):
-    """whisper-cli on me.wav -> [{start,end,speaker,text}] (all `me_name`)."""
-    wav = os.path.join(meeting_dir, "me.wav")
-    if not os.path.exists(wav):
-        return []
-    out_base = os.path.join(meeting_dir, "me")
+def to_mono(src, dst):
+    """Downmix any WAV to 16 kHz mono (whisper-cli wants mono)."""
+    subprocess.run(["/opt/homebrew/bin/ffmpeg", "-loglevel", "error", "-i", src,
+                    "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-y", dst], check=True)
+    return dst
+
+
+def transcribe_words(wav, out_base):
+    """whisper-cli (with -mc 0 loop self-heal) -> [{start,end,text}] (no speaker)."""
     data = _whisper_cli(wav, out_base)
     full = " ".join((s.get("text") or "") for s in data.get("transcription", []))
     if is_loop(full):
-        data = _whisper_cli(wav, out_base, mc0=True)   # self-heal a hallucination loop
+        data = _whisper_cli(wav, out_base, mc0=True)
     segs = []
     for s in data.get("transcription", []):
         text = (s.get("text") or "").strip()
         if not text or is_phantom(text):
             continue
         off = s.get("offsets", {})
-        segs.append({
-            "start": off.get("from", 0) / 1000.0,
-            "end": off.get("to", 0) / 1000.0,
-            "speaker": me_name,
-            "text": text,
-        })
+        segs.append({"start": off.get("from", 0) / 1000.0,
+                     "end": off.get("to", 0) / 1000.0, "text": text})
     return segs
+
+
+def transcribe_me(meeting_dir, me_name):
+    """Your mic channel -> segments all labelled `me_name` (mono-downmixed first)."""
+    wav = os.path.join(meeting_dir, "me.wav")
+    if not os.path.exists(wav):
+        return []
+    mono = to_mono(wav, os.path.join(meeting_dir, "me_mono.wav"))
+    segs = transcribe_words(mono, os.path.join(meeting_dir, "me"))
+    for s in segs:
+        s["speaker"] = me_name
+    return segs
+
+
+def channels_independent(stereo_wav):
+    """True if the two channels carry DIFFERENT audio (two mics), False if the
+    source was mono duplicated across both channels. Tests the (ch0 - ch1) signal:
+    identical channels cancel to silence; two real mics leave a strong difference."""
+    import wave
+    try:
+        wf = wave.open(stereo_wav, "rb")
+        nch = wf.getnchannels()
+        wf.close()
+    except Exception:
+        nch = 1
+    if nch < 2:
+        return False   # mono recording — nothing to split
+    diff = stereo_wav + ".diff.wav"
+    subprocess.run(["/opt/homebrew/bin/ffmpeg", "-loglevel", "error", "-i", stereo_wav,
+                    "-filter_complex", "[0:a]pan=mono|c0=c0-c1[d]", "-map", "[d]",
+                    "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", "-y", diff], check=False)
+    peak = max_db(diff)
+    try:
+        os.remove(diff)
+    except OSError:
+        pass
+    return peak is not None and peak > -70.0
+
+
+def dual_mic_diarise(meeting_dir, stereo_wav):
+    """Two mics, one clipped on each person (e.g. Rode Wireless MICRO). Transcribe
+    the mono mix once, then assign each segment to whichever mic (channel) was
+    louder in that window. Clean per-speaker labels, no ML — each person is
+    loudest on their own lav even with a bit of cross-room bleed."""
+    import wave
+    import numpy as np
+    ff = "/opt/homebrew/bin/ffmpeg"
+    mic1 = os.path.join(meeting_dir, "mic1.wav")
+    mic2 = os.path.join(meeting_dir, "mic2.wav")
+    mix = os.path.join(meeting_dir, "mix.wav")
+    for out, pan in ((mic1, "c0=c0"), (mic2, "c0=c1")):
+        subprocess.run([ff, "-loglevel", "error", "-i", stereo_wav,
+                        "-filter_complex", f"[0:a]pan=mono|{pan}[a]", "-map", "[a]",
+                        "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", "-y", out], check=True)
+    to_mono(stereo_wav, mix)
+
+    segs = transcribe_words(mix, os.path.join(meeting_dir, "mix"))
+
+    def load(w):
+        wf = wave.open(w, "rb")
+        a = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float64)
+        wf.close()
+        return a
+
+    a1, a2, sr = load(mic1), load(mic2), 16000
+
+    def energy(a, s, e):
+        seg = a[max(0, int(s * sr)):min(len(a), int(e * sr))]
+        return float(np.sqrt(np.mean(seg * seg))) if len(seg) else 0.0
+
+    out = []
+    for s in segs:
+        louder1 = energy(a1, s["start"], s["end"]) >= energy(a2, s["start"], s["end"])
+        out.append({"start": s["start"], "end": s["end"],
+                    "speaker": "Speaker 1" if louder1 else "Speaker 2", "text": s["text"]})
+    return out
 
 
 def diarise_wav(src_wav, work_dir, voices, model, min_spk, max_spk):
@@ -271,12 +346,19 @@ def main():
         if not args.no_dedupe:
             me, dropped = dedupe_mic_bleed(me, them)
         segments = me + them
-    else:
-        # No far-side system audio → in-person meeting: the mic caught everyone,
-        # so diarise the MIC channel instead of labelling it all as you.
-        print("no far-side audio — treating as in-person; diarising the mic channel.")
-        segments = diarise_wav(me_wav, os.path.join(md, "me_diar"),
+    elif os.path.exists(me_wav) and channels_independent(me_wav):
+        # In-person with two mics (one per person, e.g. Rode) → clean channel-split
+        # diarisation: assign each turn to whichever mic was louder. No ML.
+        print("dual-mic detected (2-channel input) — assigning speakers by loudest mic.")
+        segments = dual_mic_diarise(md, me_wav)
+    elif os.path.exists(me_wav):
+        # In-person, single mic: everyone on one channel → diarise it (best-effort).
+        print("no far-side audio, single mic — diarising the mic channel (best-effort).")
+        me_mono = to_mono(me_wav, os.path.join(md, "me_mono.wav"))
+        segments = diarise_wav(me_mono, os.path.join(md, "me_diar"),
                                args.voices, args.model, args.min_speakers, args.max_speakers)
+    else:
+        segments = []
 
     if not segments:
         sys.exit("no speech found in me.wav or them.wav")
