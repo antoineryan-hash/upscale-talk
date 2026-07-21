@@ -38,7 +38,9 @@ local MEETING_TRANSCRIBE = SCRIPTS_DIR .. "/meeting_transcribe.py"
 local NAME_SPEAKERS      = SCRIPTS_DIR .. "/name_speakers.py"
 local PYTHON3      = "/usr/bin/python3"                  -- has whisper + resemblyzer
 local MEETING_ME_NAME = "Antoine"                       -- label for your mic channel
-local MEETING_MODEL   = "small"  -- far-side diarisation model (small=fast, large-v3-turbo=accurate)
+local MEETING_SPEAKERS = 2  -- people sharing ONE mic in-person (set 3+ for a bigger room).
+                            -- Remote calls + dual-mic ignore this. Single-mic auto-count
+                            -- is unreliable, so we fix it; 2 suits 1:1s.
 
 -- Meeting mode is only active if its helper + pipeline are installed
 -- (helpers/setup-meeting-mode.sh). If not, double-tap falls back to the original
@@ -596,8 +598,7 @@ local function runMeetingPipeline(dir)
   local cmd = table.concat({
     PYTHON3, shellQuote(MEETING_TRANSCRIBE), shellQuote(dir),
     "--me-name", shellQuote(MEETING_ME_NAME),
-    "--voices", shellQuote(VOICES_DIR),
-    "--model", shellQuote(MEETING_MODEL),
+    "--speakers", tostring(MEETING_SPEAKERS),
   }, " ")
   local t = hs.task.new("/bin/zsh", function(exitCode, stdOut, stdErr)
     hideTranscribingIndicator()

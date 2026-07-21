@@ -32,9 +32,8 @@ import sys
 HOME = os.path.expanduser("~")
 WHISPER_CLI = "/opt/homebrew/bin/whisper-cli"
 WHISPER_MODEL = os.path.join(HOME, "upscale-talk/models/ggml-large-v3-turbo-q5_0.bin")
-DIARISE_SCRIPT = os.path.join(
-    HOME, ".claude/skills/video-transcriber/scripts/transcribe_with_speakers.py"
-)
+DIAR_DIR = os.path.join(HOME, "upscale-talk/models/diarisation")   # sherpa-onnx models
+DIAR_THRESHOLD = 0.8   # cosine cluster threshold for auto speaker-count (tunable)
 
 
 SILENCE_MAX_DB = -70.0   # a channel below this peak is a dead/silent capture
@@ -259,42 +258,87 @@ def dual_mic_diarise(meeting_dir, stereo_wav):
     return out
 
 
-def diarise_wav(src_wav, work_dir, voices, model, min_spk, max_spk):
-    """Run the video-transcriber (whisper + resemblyzer) on one WAV and return
-    [{start,end,speaker,text}] with N-speaker labels, auto-named from the voice
-    library. Used for the far side (remote) OR the mic (in-person, many voices)."""
+def _merge_tiny_speakers(turns, min_frac=0.04, min_secs=8.0):
+    """Fold spurious tiny clusters into the temporally-nearest real speaker, so
+    single-mic noise can't invent extra people. Real speakers keep every turn;
+    a genuine third person (with real talk-time) is preserved."""
+    from collections import defaultdict
+    if not turns:
+        return turns
+    total = sum(e - s for s, e, _ in turns)
+    talk = defaultdict(float)
+    for s, e, spk in turns:
+        talk[spk] += e - s
+    keep = {spk for spk, d in talk.items() if d >= min_secs and d >= min_frac * total}
+    if not keep or len(keep) == len(talk):
+        return turns
+
+    def nearest_keep(t0, t1):
+        best, bd = None, 1e9
+        for s, e, spk in turns:
+            if spk not in keep:
+                continue
+            d = 0.0 if not (e < t0 or s > t1) else min(abs(s - t1), abs(e - t0))
+            if d < bd:
+                bd, best = d, spk
+        return best if best is not None else sorted(keep)[0]
+
+    return [(s, e, spk if spk in keep else nearest_keep(s, e)) for s, e, spk in turns]
+
+
+def sherpa_turns(mono_wav, num_speakers=-1, threshold=DIAR_THRESHOLD):
+    """sherpa-onnx offline diarisation (pyannote segmentation + WeSpeaker
+    embeddings) -> cleaned [(start, end, speaker_int)]. Local, offline, no token."""
+    import wave
+    import numpy as np
+    import sherpa_onnx
+    wf = wave.open(mono_wav, "rb")
+    ch = wf.getnchannels()
+    a = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
+    wf.close()
+    if ch == 2:
+        a = a.reshape(-1, 2).mean(axis=1)
+    cfg = sherpa_onnx.OfflineSpeakerDiarizationConfig(
+        segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
+            pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(
+                model=os.path.join(DIAR_DIR, "segmentation.onnx"))),
+        embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(
+            model=os.path.join(DIAR_DIR, "embedding.onnx")),
+        clustering=sherpa_onnx.FastClusteringConfig(num_clusters=num_speakers, threshold=threshold),
+        min_duration_on=0.3, min_duration_off=0.5,
+    )
+    res = sherpa_onnx.OfflineSpeakerDiarization(cfg).process(a).sort_by_start_time()
+    return _merge_tiny_speakers([(r.start, r.end, r.speaker) for r in res])
+
+
+def _speaker_at(turns, t):
+    for s, e, spk in turns:
+        if s <= t <= e:
+            return spk
+    if not turns:
+        return 0
+    return min(turns, key=lambda x: min(abs(x[0] - t), abs(x[1] - t)))[2]
+
+
+def diarise_wav(src_wav, work_dir, num_speakers=-1):
+    """Diarise one WAV: sherpa-onnx for speaker turns + whisper-cli for the words,
+    intersected by timestamp. Returns [{start,end,speaker,text}] with 1-indexed
+    'Speaker N' labels (stable by first appearance). Used for the far side
+    (remote) or the mic (in-person, single shared mic)."""
     if not src_wav or not os.path.exists(src_wav):
         return []
     os.makedirs(work_dir, exist_ok=True)
-    staged = os.path.join(work_dir, "audio.wav")
-    subprocess.run(["cp", src_wav, staged], check=True)
-    cmd = [
-        sys.executable, DIARISE_SCRIPT, work_dir,
-        "--output", work_dir,
-        "--model", model,
-        "--min-speakers", str(min_spk),
-        "--max-speakers", str(max_spk),
-        "--min-segment-duration", "2.0",
-    ]
-    if voices and os.path.isdir(voices) and os.listdir(voices):
-        cmd += ["--references", voices]
-    subprocess.run(cmd, check=True)
-    js = os.path.join(work_dir, "audio.json")
-    if not os.path.exists(js):
-        return []
-    data = json.load(open(js))
-    segs = []
-    for s in data.get("segments", []):
-        text = (s.get("text") or "").strip()
-        if not text or is_phantom(text):
-            continue
-        segs.append({
-            "start": float(s.get("start", 0.0)),
-            "end": float(s.get("end", 0.0)),
-            "speaker": s.get("speaker", "Speaker ?"),
-            "text": text,
-        })
-    return segs
+    mono = to_mono(src_wav, os.path.join(work_dir, "audio.wav"))
+    turns = sherpa_turns(mono, num_speakers=num_speakers)
+    words = transcribe_words(mono, os.path.join(work_dir, "audio"))
+    remap, out = {}, []
+    for w in words:
+        spk = _speaker_at(turns, (w["start"] + w["end"]) / 2.0)
+        if spk not in remap:
+            remap[spk] = f"Speaker {len(remap) + 1}"
+        out.append({"start": w["start"], "end": w["end"],
+                    "speaker": remap[spk], "text": w["text"]})
+    return out
 
 
 def write_outputs(meeting_dir, segments):
@@ -320,8 +364,9 @@ def main():
     ap.add_argument("--voices", default=os.path.join(HOME, "upscale-talk/voices"))
     ap.add_argument("--model", default="small",
                     help="whisper model for the far-side channel (small/base/large-v3-turbo)")
-    ap.add_argument("--min-speakers", type=int, default=1)
-    ap.add_argument("--max-speakers", type=int, default=6)
+    ap.add_argument("--speakers", type=int, default=2,
+                    help="people sharing the mic for an in-person meeting (default 2; "
+                         "set 3+ for a bigger room). The far side of a remote call auto-detects.")
     ap.add_argument("--no-dedupe", action="store_true",
                     help="keep mic-bleed echo of the far side (off = remove it)")
     args = ap.parse_args()
@@ -329,8 +374,8 @@ def main():
     md = args.meeting_dir
     if not os.path.isdir(md):
         sys.exit(f"meeting dir not found: {md}")
-    if not os.path.exists(DIARISE_SCRIPT):
-        sys.exit(f"diarisation script missing: {DIARISE_SCRIPT}")
+    if not os.path.exists(os.path.join(DIAR_DIR, "segmentation.onnx")):
+        sys.exit(f"diarisation models missing in {DIAR_DIR} — run helpers/setup-meeting-mode.sh")
 
     me_wav = os.path.join(md, "me.wav")
     them_wav = os.path.join(md, "them.wav")
@@ -341,8 +386,7 @@ def main():
     if has_far_side:
         # Remote meeting: mic = you, far side (system audio) diarised separately.
         me = transcribe_me(md, args.me_name)
-        them = diarise_wav(them_wav, os.path.join(md, "them"),
-                           args.voices, args.model, args.min_speakers, args.max_speakers)
+        them = diarise_wav(them_wav, os.path.join(md, "them"), num_speakers=-1)  # far side: auto
         if not args.no_dedupe:
             me, dropped = dedupe_mic_bleed(me, them)
         segments = me + them
@@ -352,11 +396,10 @@ def main():
         print("dual-mic detected (2-channel input) — assigning speakers by loudest mic.")
         segments = dual_mic_diarise(md, me_wav)
     elif os.path.exists(me_wav):
-        # In-person, single mic: everyone on one channel → diarise it (best-effort).
-        print("no far-side audio, single mic — diarising the mic channel (best-effort).")
-        me_mono = to_mono(me_wav, os.path.join(md, "me_mono.wav"))
-        segments = diarise_wav(me_mono, os.path.join(md, "me_diar"),
-                               args.voices, args.model, args.min_speakers, args.max_speakers)
+        # In-person, single shared mic → sherpa-onnx diarisation, count = --speakers
+        # (auto-count on one mic is unreliable, so we fix it; default 2).
+        print(f"no far-side audio, single mic — diarising ({args.speakers} speakers).")
+        segments = diarise_wav(me_wav, os.path.join(md, "me_diar"), num_speakers=args.speakers)
     else:
         segments = []
 

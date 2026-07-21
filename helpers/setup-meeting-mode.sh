@@ -39,13 +39,26 @@ cp "$REPO/helpers/bin/capture-system.sh" "$BIN/"
 cp "$REPO/scripts/meeting_transcribe.py" "$REPO/scripts/name_speakers.py" "$SCR/"
 chmod +x "$BIN"/* "$SCR"/*.py
 
-echo "→ Checking Python deps (whisper + resemblyzer, for far-side diarisation)"
-if /usr/bin/python3 -c "import whisper, resemblyzer, sklearn, scipy, numpy" 2>/dev/null; then
-  echo "  deps OK"
+echo "→ Installing sherpa-onnx (speaker diarisation — Apache-2.0, no token, offline)"
+if /usr/bin/python3 -c "import sherpa_onnx, numpy" 2>/dev/null; then
+  echo "  sherpa-onnx already present"
 else
-  echo "  MISSING — install them with:"
-  echo "    /usr/bin/python3 -m pip install --user openai-whisper resemblyzer scikit-learn scipy numpy"
+  /usr/bin/python3 -m pip install --user --quiet sherpa-onnx numpy
 fi
+
+echo "→ Downloading diarisation models (~33 MB, ungated k2-fsa releases)"
+DIAR="$DEST/models/diarisation"
+mkdir -p "$DIAR"
+REL="https://github.com/k2-fsa/sherpa-onnx/releases/download"
+if [ ! -f "$DIAR/segmentation.onnx" ]; then
+  curl -fsSL -o /tmp/seg.tar.bz2 "$REL/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2"
+  tar xjf /tmp/seg.tar.bz2 -C /tmp
+  cp /tmp/sherpa-onnx-pyannote-segmentation-3-0/model.onnx "$DIAR/segmentation.onnx"
+fi
+if [ ! -f "$DIAR/embedding.onnx" ]; then
+  curl -fsSL -o "$DIAR/embedding.onnx" "$REL/speaker-recongition-models/wespeaker_en_voxceleb_resnet34_LM.onnx"
+fi
+echo "  models: $(ls "$DIAR" 2>/dev/null | tr '\n' ' ')"
 
 echo ""
 echo "→ ONE-TIME PERMISSION (only you can grant this):"
