@@ -107,6 +107,17 @@ def dedupe_mic_bleed(me, them, slack=2.0, contain=0.6):
     return kept, dropped
 
 
+def collapse_repeats(text):
+    """Drop consecutive duplicate sentences — kills Whisper repetition-loop tails
+    (e.g. 'I'm so excited.' x28) that slip through the diarisation engine."""
+    out = []
+    for p in re.split(r"(?<=[.!?])\s+", text):
+        if out and out[-1].strip().lower() == p.strip().lower():
+            continue
+        out.append(p)
+    return " ".join(out)
+
+
 def coalesce(segments):
     """Merge consecutive same-speaker segments into one turn (Jamie-style):
     one speaker header, all their text joined."""
@@ -221,7 +232,7 @@ def write_outputs(meeting_dir, segments):
     lines = []
     for b in coalesce(segments):
         lines.append(b["speaker"])
-        lines.append(b["text"])
+        lines.append(collapse_repeats(b["text"]))
         lines.append("")
     with open(os.path.join(meeting_dir, "transcript.txt"), "w") as f:
         f.write("\n".join(lines))

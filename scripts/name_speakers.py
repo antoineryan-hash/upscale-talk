@@ -27,6 +27,17 @@ def mmss(seconds):
     return f"{s // 60:02d}:{s % 60:02d}"
 
 
+def collapse_repeats(text):
+    """Drop consecutive duplicate sentences (Whisper repetition-loop tails)."""
+    import re
+    out = []
+    for p in re.split(r"(?<=[.!?])\s+", text):
+        if out and out[-1].strip().lower() == p.strip().lower():
+            continue
+        out.append(p)
+    return " ".join(out)
+
+
 def coalesce(segments):
     """Merge consecutive same-speaker segments into one turn (Jamie-style)."""
     blocks = []
@@ -43,7 +54,7 @@ def write_txt(meeting_dir, segments):
     lines = []
     for b in coalesce(segments):
         lines.append(b["speaker"])
-        lines.append(b["text"])
+        lines.append(collapse_repeats(b["text"]))
         lines.append("")
     open(os.path.join(meeting_dir, "transcript.txt"), "w").write("\n".join(lines))
     # Keep the Downloads copy current after speakers are named.
