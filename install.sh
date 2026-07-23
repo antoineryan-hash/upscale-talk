@@ -71,6 +71,24 @@ I can install it for you right now. Two things to expect:
     type it - that's normal. Type it and press Enter.
 
 NOBREW
+  if ! id -Gn "$(id -un)" | tr ' ' '\n' | grep -qx admin; then
+    cat <<'NOADMIN'
+→ Homebrew needs administrator rights, and this account isn't an administrator.
+
+upscale-talk needs Homebrew (a free package manager) to install its parts, and
+installing Homebrew requires a Mac administrator account. This account can't do
+that, so the install can't continue.
+
+What to do: ask whoever set up this Mac (or your IT person) to either make this
+account an administrator, or install Homebrew once for you with this line:
+
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+Then run the upscale-talk line again.
+
+NOADMIN
+    exit 1
+  fi
   printf "Install Homebrew now? [Y/n] "
   read -r reply </dev/tty
   case "$reply" in
@@ -90,7 +108,7 @@ SKIP
       echo "→ Installing Homebrew (this is the slow part - good time for a coffee)..."
       if ! NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/tty; then
         echo ""
-        echo "❌ Homebrew install didn't finish. Check your internet and run the whole line again."
+        echo "❌ Homebrew install didn't finish. This usually means either no internet, or your Mac account isn't an administrator (Homebrew needs admin rights). Ask whoever set up this Mac to make you an admin or install Homebrew once, then run the whole line again."
         exit 1
       fi
       # Put brew on PATH now (this session) and for future sessions
