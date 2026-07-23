@@ -36,7 +36,9 @@ DIAR_DIR = os.path.join(HOME, "upscale-talk/models/diarisation")   # sherpa-onnx
 DIAR_THRESHOLD = 0.8   # cosine cluster threshold for auto speaker-count (tunable)
 
 
-SILENCE_MAX_DB = -70.0   # a channel below this peak is a dead/silent capture
+SILENCE_MAX_DB = -70.0     # a channel below this peak is a dead/silent capture
+FAR_SIDE_MEAN_DB = -48.0   # far side counts as "present" only with real sustained
+                           # speech (mean), not a few blips — a failed tap sits ~-56
 
 # Whisper's stock hallucinations on silent/near-silent audio. Dropped only when
 # they are the ENTIRE segment text (so real speech containing these is untouched).
@@ -130,18 +132,28 @@ def coalesce(segments):
     return blocks
 
 
-def max_db(wav):
-    """Peak volume (dB) of a WAV via ffmpeg volumedetect, or None."""
+def _volumedetect(wav, field):
     try:
         r = subprocess.run(
             ["/opt/homebrew/bin/ffmpeg", "-i", wav, "-af", "volumedetect", "-f", "null", "-"],
             capture_output=True, text=True, check=False,
         )
-        import re
-        m = re.search(r"max_volume:\s*(-?\d+\.?\d*) dB", r.stderr or "")
+        m = re.search(rf"{field}:\s*(-?\d+\.?\d*) dB", r.stderr or "")
         return float(m.group(1)) if m else None
     except Exception:
         return None
+
+
+def max_db(wav):
+    """Peak volume (dB) of a WAV, or None."""
+    return _volumedetect(wav, "max_volume")
+
+
+def mean_db(wav):
+    """Mean volume (dB) — sustained energy / speech presence. A few loud blips
+    can't inflate it the way they inflate the peak, so this is what decides
+    whether a channel actually carries a conversation."""
+    return _volumedetect(wav, "mean_volume")
 
 
 def copy_to_downloads(meeting_dir):
@@ -379,8 +391,12 @@ def main():
 
     me_wav = os.path.join(md, "me.wav")
     them_wav = os.path.join(md, "them.wav")
-    them_peak = max_db(them_wav) if os.path.exists(them_wav) else None
-    has_far_side = them_peak is not None and them_peak >= SILENCE_MAX_DB
+    # "Far side present" needs sustained speech (mean), not loud blips — a failed
+    # system-audio tap is near-silent on average (~-56 dB) but can peak high, which
+    # used to fool this into the remote path. If the tap failed, fall through to
+    # diarising the mic, which on speakers/in-person holds the whole conversation.
+    them_mean = mean_db(them_wav) if os.path.exists(them_wav) else None
+    has_far_side = them_mean is not None and them_mean >= FAR_SIDE_MEAN_DB
 
     dropped = 0
     if has_far_side:
