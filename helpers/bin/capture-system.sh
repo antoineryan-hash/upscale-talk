@@ -14,6 +14,7 @@
 set -uo pipefail
 
 OUT="${1:?usage: capture-system.sh <out.wav>}"
+TAP_LOG="${OUT%.wav}.tap.log"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 AUDIOTEE="$HERE/audiotee"
 FFMPEG="/opt/homebrew/bin/ffmpeg"
@@ -26,7 +27,7 @@ mkfifo "$FIFO"
 FF_PID=$!
 
 # The tap streams system audio as raw PCM into the fifo.
-"$AUDIOTEE" --sample-rate 16000 2>/dev/null > "$FIFO" &
+"$AUDIOTEE" --sample-rate 16000 2>"$TAP_LOG" > "$FIFO" &
 AT_PID=$!
 
 cleanup() {

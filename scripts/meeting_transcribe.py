@@ -28,6 +28,7 @@ import os
 import re
 import subprocess
 import sys
+import wave
 
 HOME = os.path.expanduser("~")
 WHISPER_CLI = "/opt/homebrew/bin/whisper-cli"
@@ -41,7 +42,7 @@ VOICE_MATCH_MARGIN = 0.06
 
 SILENCE_MAX_DB = -70.0     # a channel below this peak is a dead/silent capture
 FAR_SIDE_MEAN_DB = -48.0   # far side counts as "present" only with real sustained
-                           # speech (mean), not a few blips — a failed tap sits ~-56
+                           # speech (mean), not a few blips — a failed tap sits ~-91
 
 # Whisper's stock hallucinations on silent/near-silent audio. Dropped only when
 # they are the ENTIRE segment text (so real speech containing these is untouched).
@@ -157,6 +158,16 @@ def mean_db(wav):
     can't inflate it the way they inflate the peak, so this is what decides
     whether a channel actually carries a conversation."""
     return _volumedetect(wav, "mean_volume")
+
+
+def wav_duration(wav):
+    """Duration in seconds from a WAV header, or None when it cannot be read."""
+    try:
+        with wave.open(wav, "rb") as wf:
+            frame_rate = wf.getframerate()
+            return wf.getnframes() / frame_rate if frame_rate else None
+    except (OSError, EOFError, wave.Error):
+        return None
 
 
 def copy_to_downloads(meeting_dir):
@@ -460,7 +471,8 @@ def _speaker_at(turns, t):
     return min(turns, key=lambda x: min(abs(x[0] - t), abs(x[1] - t)))[2]
 
 
-def diarise_wav(src_wav, work_dir, num_speakers=-1, voices_dir=None):
+def diarise_wav(src_wav, work_dir, num_speakers=-1, voices_dir=None,
+                hedge_names=False):
     """Diarise one WAV: sherpa-onnx for speaker turns + whisper-cli for tokens,
     intersected by timestamp. Returns [{start,end,speaker,text}] with 1-indexed
     'Speaker N' labels (stable by first appearance). Used for the far side
@@ -493,19 +505,19 @@ def diarise_wav(src_wav, work_dir, num_speakers=-1, voices_dir=None):
         spk_int = segment["speaker"]
         if spk_int not in remap:
             if spk_int in names:
-                remap[spk_int] = names[spk_int]
+                remap[spk_int] = names[spk_int] + ("?" if hedge_names else "")
             else:
                 unnamed_count += 1
                 remap[spk_int] = f"Speaker {unnamed_count}"
         out.append({"start": segment["start"], "end": segment["end"],
                     "speaker": remap[spk_int], "text": text})
-    applied_names = sorted(set(remap.values()) & set(names.values()))
+    applied_names = sorted({names[spk] for spk in remap if spk in names})
     if applied_names:
         print(f"matched from voice library: {', '.join(applied_names)}")
     return out
 
 
-def write_outputs(meeting_dir, segments):
+def write_outputs(meeting_dir, segments, *, header_lines=None):
     segments.sort(key=lambda s: s["start"])
     # transcript.json keeps the fine-grained segments (so naming can re-render).
     with open(os.path.join(meeting_dir, "transcript.json"), "w") as f:
@@ -513,6 +525,9 @@ def write_outputs(meeting_dir, segments):
     # transcript.txt: minimal for LLMs — speaker name, then their text, per turn.
     # (Timestamps stay in transcript.json if you ever need to dive in.)
     lines = []
+    if header_lines:
+        lines.extend(f"# {line}" for line in header_lines)
+        lines.append("")
     for b in coalesce(segments):
         lines.append(b["speaker"])
         lines.append(collapse_repeats(b["text"]))
@@ -544,11 +559,44 @@ def main():
     me_wav = os.path.join(md, "me.wav")
     them_wav = os.path.join(md, "them.wav")
     # "Far side present" needs sustained speech (mean), not loud blips — a failed
-    # system-audio tap is near-silent on average (~-56 dB) but can peak high, which
+    # system-audio tap is near-silent on average (~-91 dB) but can peak high, which
     # used to fool this into the remote path. If the tap failed, fall through to
     # diarising the mic, which on speakers/in-person holds the whole conversation.
-    them_mean = mean_db(them_wav) if os.path.exists(them_wav) else None
-    has_far_side = them_mean is not None and them_mean >= FAR_SIDE_MEAN_DB
+    them_exists = os.path.exists(them_wav)
+    them_mean = mean_db(them_wav) if them_exists else None
+    them_duration = wav_duration(them_wav) if them_exists else None
+    tap_is_long = them_duration is not None and them_duration > 60.0
+    has_far_side = (
+        them_exists
+        and tap_is_long
+        and them_mean is not None
+        and them_mean >= FAR_SIDE_MEAN_DB
+    )
+    tap_failed = (
+        them_exists
+        and tap_is_long
+        and them_mean is not None
+        and them_mean < FAR_SIDE_MEAN_DB
+    )
+
+    header_lines = []
+    if has_far_side:
+        header_lines.append(f"far-side capture: {them_mean:.1f} dB (ok)")
+    elif tap_failed:
+        print(
+            f"WARNING: system-audio capture FAILED (mean {them_mean:.1f} dB) - "
+            "falling back to the mic; speaker count auto-detected and may be wrong."
+        )
+        header_lines.append(
+            f"far-side capture: {them_mean:.1f} dB (FAILED - fell back to mic)"
+        )
+    elif them_exists:
+        level = f"{them_mean:.1f} dB" if them_mean is not None else "level unavailable"
+        header_lines.append(
+            f"far-side capture: {level} (short capture; treated as in-person)"
+        )
+    else:
+        header_lines.append("far-side capture: not present (in-person)")
 
     dropped = 0
     if has_far_side:
@@ -559,6 +607,13 @@ def main():
         if not args.no_dedupe:
             me, dropped = dedupe_mic_bleed(me, them)
         segments = me + them
+    elif tap_failed and os.path.exists(me_wav):
+        # A long, silent tap means this was not necessarily an in-person meeting.
+        # The shared mic may contain any number of people, so let diarisation infer it.
+        segments = diarise_wav(
+            me_wav, os.path.join(md, "me_diar"), num_speakers=-1,
+            voices_dir=args.voices, hedge_names=True,
+        )
     elif os.path.exists(me_wav) and channels_independent(me_wav):
         # In-person with two mics (one per person, e.g. Rode) → clean channel-split
         # diarisation: assign each turn to whichever mic was louder. No ML.
@@ -575,7 +630,22 @@ def main():
 
     if not segments:
         sys.exit("no speech found in me.wav or them.wav")
-    write_outputs(md, segments)
+    if tap_failed:
+        speakers_found = sorted({segment["speaker"] for segment in segments})
+        header_lines.append(
+            f"speakers: auto-detected ({len(speakers_found)} found)"
+        )
+        matched_names = sorted({
+            speaker.rstrip("?")
+            for speaker in speakers_found
+            if not speaker.lower().startswith("speaker")
+        })
+        if matched_names:
+            header_lines.append(
+                f"names: {', '.join(matched_names)} matched from voice library "
+                "(acoustic match, not verified)"
+            )
+    write_outputs(md, segments, header_lines=header_lines)
     dl = copy_to_downloads(md)
     if dropped:
         print(f"removed {dropped} mic-bleed echo segment(s) (far side leaking into your mic).")
