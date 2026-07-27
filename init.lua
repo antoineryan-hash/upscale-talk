@@ -37,6 +37,7 @@ local SCRIPTS_DIR  = HOME .. "/upscale-talk/scripts"
 local TAP_CAPTURE  = BIN_DIR .. "/capture-system.sh"    -- audiotee → them.wav
 local MEETING_TRANSCRIBE = SCRIPTS_DIR .. "/meeting_transcribe.py"
 local NAME_SPEAKERS      = SCRIPTS_DIR .. "/name_speakers.py"
+local LLM_DIARISE        = SCRIPTS_DIR .. "/llm_diarise.py"
 local PYTHON3      = "/usr/bin/python3"                  -- has whisper + resemblyzer
 local MEETING_ME_NAME = "Antoine"                       -- label for your mic channel
 local MEETING_SPEAKERS = 2  -- people sharing ONE mic in-person (set 3+ for a bigger room).
@@ -597,11 +598,16 @@ end
 
 local function runMeetingPipeline(dir)
   -- Run through a login shell so ffmpeg (brew) + python deps resolve as normal.
-  local cmd = table.concat({
-    PYTHON3, shellQuote(MEETING_TRANSCRIBE), shellQuote(dir),
+  local transcribeCmd = table.concat({
+    shellQuote(PYTHON3), shellQuote(MEETING_TRANSCRIBE), shellQuote(dir),
     "--me-name", shellQuote(MEETING_ME_NAME),
     "--speakers", tostring(MEETING_SPEAKERS),
   }, " ")
+  local llmCmd = table.concat({
+    shellQuote(PYTHON3), shellQuote(LLM_DIARISE), shellQuote(dir),
+    "--auto-roster", "--as-primary",
+  }, " ")
+  local cmd = transcribeCmd .. " && { " .. llmCmd .. " || true; }"
   local t = hs.task.new("/bin/zsh", function(exitCode, stdOut, stdErr)
     hideTranscribingIndicator()
     if exitCode ~= 0 then
