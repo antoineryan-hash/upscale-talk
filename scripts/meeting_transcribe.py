@@ -15,7 +15,7 @@ Produces:
 
 Channel split = free 2-way diarisation: your mic is always you; the far side is
 diarised into distinct voices and auto-named from the reference library
-(~/upscale-talk/voices) when a voice is recognised (cosine >= 0.75), else
+(~/upscale-talk/voices) when a voice is recognised (cosine >= 0.70), else
 "Speaker N" (name them afterwards with name_speakers.py).
 
 The 'me' channel is transcribed with whisper-cli (large-v3-turbo, GPU-fast).
@@ -34,6 +34,9 @@ WHISPER_CLI = "/opt/homebrew/bin/whisper-cli"
 WHISPER_MODEL = os.path.join(HOME, "upscale-talk/models/ggml-large-v3-turbo-q5_0.bin")
 DIAR_DIR = os.path.join(HOME, "upscale-talk/models/diarisation")   # sherpa-onnx models
 DIAR_THRESHOLD = 0.8   # cosine cluster threshold for auto speaker-count (tunable)
+VOICES_DIR = os.path.join(HOME, "upscale-talk/voices")
+VOICE_MATCH_MIN = 0.70
+VOICE_MATCH_MARGIN = 0.06
 
 
 SILENCE_MAX_DB = -70.0     # a channel below this peak is a dead/silent capture
@@ -346,6 +349,108 @@ def sherpa_turns(mono_wav, num_speakers=-1, threshold=DIAR_THRESHOLD):
     return _merge_tiny_speakers([(r.start, r.end, r.speaker) for r in res])
 
 
+def _embed_samples(samples_float32, extractor=None):
+    """Return a normalised sherpa-onnx speaker embedding."""
+    import numpy as np
+    import sherpa_onnx
+    ext = extractor or sherpa_onnx.SpeakerEmbeddingExtractor(
+        sherpa_onnx.SpeakerEmbeddingExtractorConfig(
+            model=os.path.join(DIAR_DIR, "embedding.onnx")))
+    st = ext.create_stream()
+    st.accept_waveform(16000, samples_float32)
+    st.input_finished()
+    v = np.array(ext.compute(st), dtype=np.float32)
+    v /= (np.linalg.norm(v) + 1e-9)
+    return v
+
+
+def match_voices(mono_wav, turns, voices_dir):
+    """Match diarised speaker IDs to unique names from reference voice clips."""
+    try:
+        import wave
+        import numpy as np
+        import sherpa_onnx
+
+        if not voices_dir or not os.path.isdir(voices_dir):
+            return {}
+        reference_paths = sorted(
+            os.path.join(voices_dir, filename)
+            for filename in os.listdir(voices_dir)
+            if filename.endswith(".wav")
+        )
+        if not reference_paths:
+            return {}
+
+        def load_wav(path):
+            wf = wave.open(path, "rb")
+            audio = (np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+                     .astype(np.float32) / 32768.0)
+            channels = wf.getnchannels()
+            wf.close()
+            if channels == 2:
+                audio = audio.reshape(-1, 2).mean(axis=1)
+            return audio
+
+        audio = load_wav(mono_wav)
+        extractor = sherpa_onnx.SpeakerEmbeddingExtractor(
+            sherpa_onnx.SpeakerEmbeddingExtractorConfig(
+                model=os.path.join(DIAR_DIR, "embedding.onnx")))
+
+        speaker_embeddings = {}
+        for speaker in sorted({speaker for _, _, speaker in turns}):
+            segments = sorted(
+                ((start, end) for start, end, spk in turns if spk == speaker),
+                key=lambda segment: segment[1] - segment[0],
+                reverse=True,
+            )
+            clips = []
+            gathered = 0.0
+            for start, end in segments:
+                start_frame = max(0, int(start * 16000))
+                end_frame = min(len(audio), int(end * 16000))
+                if end_frame <= start_frame:
+                    continue
+                clips.append(audio[start_frame:end_frame])
+                gathered += (end_frame - start_frame) / 16000.0
+                if gathered >= 30.0:
+                    break
+            if clips:
+                speaker_embeddings[speaker] = _embed_samples(
+                    np.concatenate(clips), extractor)
+
+        references = {}
+        for path in reference_paths:
+            name = os.path.splitext(os.path.basename(path))[0]
+            reference_audio = load_wav(path)
+            if len(reference_audio):
+                references[name] = _embed_samples(reference_audio, extractor)
+        if not speaker_embeddings or not references:
+            return {}
+
+        candidates = []
+        for speaker, embedding in speaker_embeddings.items():
+            scores = sorted(
+                ((float(np.dot(embedding, reference)), name)
+                 for name, reference in references.items()),
+                reverse=True,
+            )
+            best_score, best_name = scores[0]
+            margin_ok = len(scores) == 1 or best_score - scores[1][0] >= VOICE_MATCH_MARGIN
+            if best_score >= VOICE_MATCH_MIN and margin_ok:
+                candidates.append((best_score, speaker, best_name))
+
+        matches = {}
+        assigned_names = set()
+        for _, speaker, name in sorted(
+                candidates, key=lambda candidate: candidate[0], reverse=True):
+            if name not in assigned_names:
+                matches[speaker] = name
+                assigned_names.add(name)
+        return matches
+    except Exception:
+        return {}
+
+
 def _speaker_at(turns, t):
     for s, e, spk in turns:
         if s <= t <= e:
@@ -355,7 +460,7 @@ def _speaker_at(turns, t):
     return min(turns, key=lambda x: min(abs(x[0] - t), abs(x[1] - t)))[2]
 
 
-def diarise_wav(src_wav, work_dir, num_speakers=-1):
+def diarise_wav(src_wav, work_dir, num_speakers=-1, voices_dir=None):
     """Diarise one WAV: sherpa-onnx for speaker turns + whisper-cli for tokens,
     intersected by timestamp. Returns [{start,end,speaker,text}] with 1-indexed
     'Speaker N' labels (stable by first appearance). Used for the far side
@@ -365,6 +470,9 @@ def diarise_wav(src_wav, work_dir, num_speakers=-1):
     os.makedirs(work_dir, exist_ok=True)
     mono = to_mono(src_wav, os.path.join(work_dir, "audio.wav"))
     turns = sherpa_turns(mono, num_speakers=num_speakers)
+    if voices_dir is None:
+        voices_dir = VOICES_DIR
+    names = match_voices(mono, turns, voices_dir)
     toks = transcribe_tokens(mono, os.path.join(work_dir, "audio"))
     merged = []
     for t in toks:
@@ -377,15 +485,23 @@ def diarise_wav(src_wav, work_dir, num_speakers=-1):
                            "speaker": spk_int, "text": t["text"]})
 
     remap, out = {}, []
+    unnamed_count = 0
     for segment in merged:
         text = segment["text"].strip()
         if not text or is_phantom(text):
             continue
         spk_int = segment["speaker"]
         if spk_int not in remap:
-            remap[spk_int] = f"Speaker {len(remap) + 1}"
+            if spk_int in names:
+                remap[spk_int] = names[spk_int]
+            else:
+                unnamed_count += 1
+                remap[spk_int] = f"Speaker {unnamed_count}"
         out.append({"start": segment["start"], "end": segment["end"],
                     "speaker": remap[spk_int], "text": text})
+    applied_names = sorted(set(remap.values()) & set(names.values()))
+    if applied_names:
+        print(f"matched from voice library: {', '.join(applied_names)}")
     return out
 
 
@@ -409,7 +525,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("meeting_dir")
     ap.add_argument("--me-name", default="Antoine")
-    ap.add_argument("--voices", default=os.path.join(HOME, "upscale-talk/voices"))
+    ap.add_argument("--voices", default=VOICES_DIR)
     ap.add_argument("--model", default="small",
                     help="whisper model for the far-side channel (small/base/large-v3-turbo)")
     ap.add_argument("--speakers", type=int, default=2,
@@ -438,7 +554,8 @@ def main():
     if has_far_side:
         # Remote meeting: mic = you, far side (system audio) diarised separately.
         me = transcribe_me(md, args.me_name)
-        them = diarise_wav(them_wav, os.path.join(md, "them"), num_speakers=-1)  # far side: auto
+        them = diarise_wav(them_wav, os.path.join(md, "them"), num_speakers=-1,
+                           voices_dir=args.voices)  # far side: auto
         if not args.no_dedupe:
             me, dropped = dedupe_mic_bleed(me, them)
         segments = me + them
@@ -451,7 +568,8 @@ def main():
         # In-person, single shared mic → sherpa-onnx diarisation, count = --speakers
         # (auto-count on one mic is unreliable, so we fix it; default 2).
         print(f"no far-side audio, single mic — diarising ({args.speakers} speakers).")
-        segments = diarise_wav(me_wav, os.path.join(md, "me_diar"), num_speakers=args.speakers)
+        segments = diarise_wav(me_wav, os.path.join(md, "me_diar"),
+                               num_speakers=args.speakers, voices_dir=args.voices)
     else:
         segments = []
 
