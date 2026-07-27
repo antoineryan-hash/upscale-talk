@@ -23,6 +23,7 @@ The 'them' channel is transcribed + diarised by the video-transcriber script
 (openai-whisper + resemblyzer). See --model to trade speed vs accuracy there.
 """
 import argparse
+from bisect import bisect_left
 import json
 import os
 import re
@@ -38,6 +39,7 @@ DIAR_THRESHOLD = 0.8   # cosine cluster threshold for auto speaker-count (tunabl
 VOICES_DIR = os.path.join(HOME, "upscale-talk/voices")
 VOICE_MATCH_MIN = 0.70
 VOICE_MATCH_MARGIN = 0.06
+MIN_NESTED_TURN_S = 0.5   # a turn shorter than this is segmentation noise, not an interjection
 
 
 SILENCE_MAX_DB = -70.0     # a channel below this peak is a dead/silent capture
@@ -471,6 +473,63 @@ def _speaker_at(turns, t):
     return min(turns, key=lambda x: min(abs(x[0] - t), abs(x[1] - t)))[2]
 
 
+class _TurnIndex:
+    def __init__(self, turns):
+        self.turns = sorted(turns, key=lambda turn: turn[0])
+        self.starts = [turn[0] for turn in self.turns]
+        self.max_duration = max(
+            (max(0.0, turn[1] - turn[0]) for turn in self.turns),
+            default=0.0,
+        )
+
+
+def _speaker_for_span(turns, start, end):
+    """Return the speaker with the greatest accumulated overlap with a span."""
+    index = turns if isinstance(turns, _TurnIndex) else _TurnIndex(turns)
+    if not index.turns:
+        return 0
+
+    first = bisect_left(index.starts, start - index.max_duration)
+    last = bisect_left(index.starts, end)
+    overlap_by_speaker = {}
+    shortest_turn_by_speaker = {}
+    for turn_start, turn_end, speaker in index.turns[first:last]:
+        overlap = max(0.0, min(end, turn_end) - max(start, turn_start))
+        if overlap:
+            overlap_by_speaker[speaker] = (
+                overlap_by_speaker.get(speaker, 0.0) + overlap
+            )
+            turn_duration = turn_end - turn_start
+            shortest_turn_by_speaker[speaker] = min(
+                shortest_turn_by_speaker.get(speaker, turn_duration),
+                turn_duration,
+            )
+
+    if overlap_by_speaker:
+        greatest_overlap = max(overlap_by_speaker.values())
+        tie_tolerance = max(1e-6, 0.10 * (end - start))
+        tied_speakers = [
+            speaker
+            for speaker, overlap in overlap_by_speaker.items()
+            if greatest_overlap - overlap <= tie_tolerance
+        ]
+        specific_speakers = [
+            speaker
+            for speaker in tied_speakers
+            if shortest_turn_by_speaker[speaker] >= MIN_NESTED_TURN_S
+        ]
+        if specific_speakers:
+            return min(
+                specific_speakers,
+                key=lambda speaker: (shortest_turn_by_speaker[speaker], speaker),
+            )
+        return min(
+            tied_speakers,
+            key=lambda speaker: (-overlap_by_speaker[speaker], speaker),
+        )
+    return _speaker_at(index.turns, (start + end) / 2.0)
+
+
 def diarise_wav(src_wav, work_dir, num_speakers=-1, voices_dir=None,
                 hedge_names=False):
     """Diarise one WAV: sherpa-onnx for speaker turns + whisper-cli for tokens,
@@ -485,10 +544,11 @@ def diarise_wav(src_wav, work_dir, num_speakers=-1, voices_dir=None,
     if voices_dir is None:
         voices_dir = VOICES_DIR
     names = match_voices(mono, turns, voices_dir)
+    turns = _TurnIndex(turns)
     toks = transcribe_tokens(mono, os.path.join(work_dir, "audio"))
     merged = []
     for t in toks:
-        spk_int = _speaker_at(turns, (t["start"] + t["end"]) / 2.0)
+        spk_int = _speaker_for_span(turns, t["start"], t["end"])
         if merged and merged[-1]["speaker"] == spk_int:
             merged[-1]["end"] = t["end"]
             merged[-1]["text"] += t["text"]
@@ -608,10 +668,16 @@ def main():
             me, dropped = dedupe_mic_bleed(me, them)
         segments = me + them
     elif tap_failed and os.path.exists(me_wav):
-        # A long, silent tap means this was not necessarily an in-person meeting.
-        # The shared mic may contain any number of people, so let diarisation infer it.
+        # No usable system audio == nobody was on the far end == an in-person
+        # meeting, so everyone is on the shared mic and it MUST be diarised.
+        # Use the configured count, NOT auto: auto-detect is measurably
+        # unreliable on a single mic (it collapsed a real 2-person meeting to
+        # one speaker, while forcing 2 found the second person). Names are still
+        # hedged because a failed tap means we can't be sure of the room.
+        print(f"no usable far-side audio — in-person; diarising the mic "
+              f"({args.speakers} speakers).")
         segments = diarise_wav(
-            me_wav, os.path.join(md, "me_diar"), num_speakers=-1,
+            me_wav, os.path.join(md, "me_diar"), num_speakers=args.speakers,
             voices_dir=args.voices, hedge_names=True,
         )
     elif os.path.exists(me_wav) and channels_independent(me_wav):
