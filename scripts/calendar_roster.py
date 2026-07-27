@@ -137,16 +137,34 @@ def parse_meeting_start(meeting_dir):
     return parsed.astimezone()
 
 
+def _wav_duration(path):
+    """Return a robust WAV duration, mirroring meeting_transcribe.wav_duration."""
+    try:
+        with wave.open(path, "rb") as audio:
+            nframes = audio.getnframes()
+            frame_rate = audio.getframerate()
+            channels = audio.getnchannels()
+            sample_width = audio.getsampwidth() or 2
+        denominator = frame_rate * channels * sample_width
+        if not denominator:
+            return None
+        data_bytes = max(0, os.path.getsize(path) - 44)
+        data_duration = data_bytes / denominator
+        header_duration = nframes / frame_rate
+        if (nframes in (0, 0x3FFFFFFF, 0xFFFFFFFF)
+                or header_duration > data_duration * 1.05):
+            return data_duration
+        return header_duration
+    except (OSError, EOFError, wave.Error):
+        return None
+
+
 def audio_duration_seconds(meeting_dir):
     """Return the preferred audio duration, or one hour when audio is absent."""
     for filename in ("me.wav", "them.wav"):
         path = os.path.join(meeting_dir, filename)
         if os.path.isfile(path):
-            with wave.open(path, "rb") as audio:
-                frame_rate = audio.getframerate()
-                if frame_rate <= 0:
-                    raise ValueError("audio frame rate is invalid")
-                return audio.getnframes() / frame_rate
+            return _wav_duration(path)
     return 60 * 60
 
 

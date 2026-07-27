@@ -163,11 +163,23 @@ def mean_db(wav):
 
 
 def wav_duration(wav):
-    """Duration in seconds from a WAV header, or None when it cannot be read."""
+    """Duration in seconds from a WAV, or None when it cannot be read."""
     try:
         with wave.open(wav, "rb") as wf:
+            nframes = wf.getnframes()
             frame_rate = wf.getframerate()
-            return wf.getnframes() / frame_rate if frame_rate else None
+            channels = wf.getnchannels()
+            sample_width = wf.getsampwidth() or 2
+        denominator = frame_rate * channels * sample_width
+        if not denominator:
+            return None
+        data_bytes = max(0, os.path.getsize(wav) - 44)
+        data_duration = data_bytes / denominator
+        header_duration = nframes / frame_rate
+        if (nframes in (0, 0x3FFFFFFF, 0xFFFFFFFF)
+                or header_duration > data_duration * 1.05):
+            return data_duration
+        return header_duration
     except (OSError, EOFError, wave.Error):
         return None
 
