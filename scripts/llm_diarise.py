@@ -28,6 +28,21 @@ def parse_roster(value):
     return names
 
 
+def merge_rosters(*rosters):
+    """Merge roster name lists without changing their first-seen order."""
+    merged = []
+    seen = set()
+    for roster in rosters:
+        for name in roster:
+            if not name:
+                continue
+            key = name.casefold()
+            if key not in seen:
+                merged.append(name)
+                seen.add(key)
+    return merged
+
+
 def load_input_stream(transcript_path):
     """Load transcript JSON and concatenate text in timestamp order."""
     try:
@@ -369,6 +384,25 @@ def reference_voice_roster():
     ]
 
 
+def calendar_roster(meeting_dir):
+    """Return names printed by calendar_roster.py, or [] when unavailable."""
+    script_path = os.path.join(os.path.dirname(__file__), "calendar_roster.py")
+    try:
+        completed = subprocess.run(
+            ["/usr/bin/python3", script_path, meeting_dir],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    output = completed.stdout.strip()
+    if not output:
+        return []
+    return parse_roster(output.splitlines()[0])
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Create a meaning-only speaker-labelled comparison transcript."
@@ -381,6 +415,7 @@ def parse_args(argv=None):
         default="auto",
     )
     parser.add_argument("--auto-roster", action="store_true")
+    parser.add_argument("--calendar-roster", action="store_true")
     parser.add_argument("--as-primary", action="store_true")
     parser.add_argument("--context", default="")
     parser.add_argument("--out", default="transcript_llm.txt")
@@ -416,12 +451,27 @@ def main(argv=None):
         return 0
 
     chunks = split_chunks(input_stream)
+    roster_source = "none"
     if args.roster is not None:
         roster = parse_roster(args.roster)
-    elif args.auto_roster:
-        roster = reference_voice_roster()
+        roster_source = "explicit" if roster else "none"
     else:
-        roster = []
+        calendar_names = (
+            calendar_roster(meeting_dir) if args.calendar_roster else []
+        )
+        voice_names = reference_voice_roster() if args.auto_roster else []
+        roster = merge_rosters(calendar_names, voice_names)
+        if calendar_names and voice_names:
+            roster_source = "calendar + voice library"
+        elif calendar_names:
+            roster_source = "calendar"
+        elif voice_names:
+            roster_source = "voice library"
+    roster_text = ", ".join(roster)
+    print(
+        f"roster: {roster_source}"
+        + (f" ({roster_text})" if roster_text else "")
+    )
     chunk_output_paths = []
     chunk_results = []
     previous_turns = ""

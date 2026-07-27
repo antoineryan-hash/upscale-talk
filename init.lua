@@ -605,7 +605,7 @@ local function runMeetingPipeline(dir)
   }, " ")
   local llmCmd = table.concat({
     shellQuote(PYTHON3), shellQuote(LLM_DIARISE), shellQuote(dir),
-    "--auto-roster", "--as-primary",
+    "--calendar-roster", "--auto-roster", "--as-primary",
   }, " ")
   local cmd = transcribeCmd .. " && { " .. llmCmd .. " || true; }"
   local t = hs.task.new("/bin/zsh", function(exitCode, stdOut, stdErr)
