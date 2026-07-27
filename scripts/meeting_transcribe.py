@@ -194,6 +194,29 @@ def transcribe_words(wav, out_base):
     return segs
 
 
+def transcribe_tokens(wav, out_base):
+    """whisper-cli full JSON -> timestamped token units (no speaker)."""
+    args = [WHISPER_CLI, "-m", WHISPER_MODEL, "-f", wav, "-ojf", "-of", out_base]
+    subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    data = json.load(open(out_base + ".json"))
+    full = " ".join((s.get("text") or "") for s in data.get("transcription", []))
+    if is_loop(full):
+        subprocess.run(args + ["-mc", "0"], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, check=True)
+        data = json.load(open(out_base + ".json"))
+    toks = []
+    for s in data.get("transcription", []):
+        for token in s.get("tokens", []):
+            text = token["text"]
+            stripped = text.strip()
+            if not stripped or re.match(r"^\[.*\]$", stripped):
+                continue
+            off = token["offsets"]
+            toks.append({"start": off["from"] / 1000.0,
+                         "end": off["to"] / 1000.0, "text": text})
+    return toks
+
+
 def transcribe_me(meeting_dir, me_name):
     """Your mic channel -> segments all labelled `me_name` (mono-downmixed first)."""
     wav = os.path.join(meeting_dir, "me.wav")
@@ -333,7 +356,7 @@ def _speaker_at(turns, t):
 
 
 def diarise_wav(src_wav, work_dir, num_speakers=-1):
-    """Diarise one WAV: sherpa-onnx for speaker turns + whisper-cli for the words,
+    """Diarise one WAV: sherpa-onnx for speaker turns + whisper-cli for tokens,
     intersected by timestamp. Returns [{start,end,speaker,text}] with 1-indexed
     'Speaker N' labels (stable by first appearance). Used for the far side
     (remote) or the mic (in-person, single shared mic)."""
@@ -342,14 +365,27 @@ def diarise_wav(src_wav, work_dir, num_speakers=-1):
     os.makedirs(work_dir, exist_ok=True)
     mono = to_mono(src_wav, os.path.join(work_dir, "audio.wav"))
     turns = sherpa_turns(mono, num_speakers=num_speakers)
-    words = transcribe_words(mono, os.path.join(work_dir, "audio"))
+    toks = transcribe_tokens(mono, os.path.join(work_dir, "audio"))
+    merged = []
+    for t in toks:
+        spk_int = _speaker_at(turns, (t["start"] + t["end"]) / 2.0)
+        if merged and merged[-1]["speaker"] == spk_int:
+            merged[-1]["end"] = t["end"]
+            merged[-1]["text"] += t["text"]
+        else:
+            merged.append({"start": t["start"], "end": t["end"],
+                           "speaker": spk_int, "text": t["text"]})
+
     remap, out = {}, []
-    for w in words:
-        spk = _speaker_at(turns, (w["start"] + w["end"]) / 2.0)
-        if spk not in remap:
-            remap[spk] = f"Speaker {len(remap) + 1}"
-        out.append({"start": w["start"], "end": w["end"],
-                    "speaker": remap[spk], "text": w["text"]})
+    for segment in merged:
+        text = segment["text"].strip()
+        if not text or is_phantom(text):
+            continue
+        spk_int = segment["speaker"]
+        if spk_int not in remap:
+            remap[spk_int] = f"Speaker {len(remap) + 1}"
+        out.append({"start": segment["start"], "end": segment["end"],
+                    "speaker": remap[spk_int], "text": text})
     return out
 
 
