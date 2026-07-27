@@ -119,11 +119,29 @@ def split_chunks(text, target=CHUNK_CHARS):
     return chunks
 
 
-def build_prompt(chunk, roster, context, output_path, previous_turns, backend):
+def build_prompt(
+    chunk,
+    roster,
+    context,
+    output_path,
+    previous_turns,
+    backend,
+    acoustic_speaker_count=0,
+):
     """Build the instructions for one independent text-only diarisation pass."""
     roster_text = ", ".join(roster) if roster else "(empty)"
     context_text = context.strip() or "(none supplied)"
     continuity = previous_turns.strip() or "(none: this is the first chunk)"
+    expected = max(acoustic_speaker_count, len(roster))
+    acoustic_hint = ""
+    if expected >= 1:
+        acoustic_hint = f"""
+Audio analysis and the attendee list together suggest about {expected} distinct speakers.
+Do not invent speakers beyond the people the words actually support. Equally,
+never merge two people into one label to reach a smaller number — if the words
+show another person, label them, even beyond {expected}. Any attendee who does
+not speak simply does not appear.
+"""
     if backend == "codex":
         output_instruction = f"""Write the result to this exact file:
 {output_path}
@@ -143,6 +161,7 @@ identifies that person. When a speaker is clearly a DIFFERENT person from anyone
 identifiable in the roster, label them Speaker 1, Speaker 2, and so on. Number
 unnamed speakers consistently in order of first appearance across the whole
 transcript.
+{acoustic_hint}
 Meeting context: {context_text}
 
 Split the CHUNK below into speaker turns and label every turn. Use:
@@ -236,15 +255,23 @@ def input_speaker_count(transcript_path):
         return 0
     if not isinstance(segments, list):
         return 0
-    return len(
-        {
-            segment["speaker"].strip()
-            for segment in segments
-            if isinstance(segment, dict)
-            and isinstance(segment.get("speaker"), str)
-            and segment["speaker"].strip()
-        }
-    )
+    speakers = set()
+    for segment in segments:
+        if not isinstance(segment, dict) or not isinstance(
+            segment.get("speaker"), str
+        ):
+            continue
+        speaker = segment["speaker"].strip()
+        previous = None
+        while speaker != previous:
+            previous = speaker
+            if speaker.endswith(" (mixed)"):
+                speaker = speaker[: -len(" (mixed)")].rstrip()
+            if speaker.endswith("?"):
+                speaker = speaker[:-1].rstrip()
+        if speaker:
+            speakers.add(speaker)
+    return len(speakers)
 
 
 def remove_files(paths):
@@ -450,6 +477,7 @@ def main(argv=None):
     if input_stream is None:
         return 0
 
+    acoustic_speaker_count = input_speaker_count(transcript_path)
     chunks = split_chunks(input_stream)
     roster_source = "none"
     if args.roster is not None:
@@ -467,6 +495,7 @@ def main(argv=None):
             roster_source = "calendar"
         elif voice_names:
             roster_source = "voice library"
+    expected = max(acoustic_speaker_count, len(roster))
     roster_text = ", ".join(roster)
     print(
         f"roster: {roster_source}"
@@ -487,6 +516,7 @@ def main(argv=None):
             chunk_output_path,
             previous_turns,
             backend,
+            acoustic_speaker_count,
         )
         chunk_result = run_llm(prompt, meeting_dir, chunk_output_path, backend)
         if chunk_result is None:
@@ -514,11 +544,10 @@ def main(argv=None):
         return 0
 
     counts = turn_counts(combined)
-    source_speaker_count = input_speaker_count(transcript_path)
-    if len(counts) == 1 and source_speaker_count > 1:
+    if len(counts) == 1 and acoustic_speaker_count > 1:
         print(
             "WARNING: the LLM returned a single speaker for a transcript that "
-            f"had {source_speaker_count} - check {output_path} before trusting it"
+            f"had {acoustic_speaker_count} - check {output_path} before trusting it"
         )
 
     downloads_path = os.path.join(
@@ -545,6 +574,10 @@ def main(argv=None):
         f"{speaker}: {count}" for speaker, count in sorted(counts.items())
     )
     print(f"Chunks processed: {len(chunks)}; backend: {backend}")
+    print(
+        f"speaker prior: {expected} "
+        f"(acoustic {acoustic_speaker_count}, roster {len(roster)})"
+    )
     print(f"Word-preservation fraction: {fraction:.3f}")
     print(f"Per-speaker turn counts: {counts_text or '(none)'}")
     print(f"Output: {output_path}")
