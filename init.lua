@@ -25,6 +25,7 @@ local WHISPER = "/opt/homebrew/bin/whisper-cli"
 local HISTORY_DIR    = HOME .. "/upscale-talk/history"
 local HISTORY_MAX    = 20      -- entries shown in menubar
 local DOUBLE_TAP_WINDOW = 0.4
+local MEETING_RESTART_COOLDOWN = 2.0  -- seconds; ignore fn taps just after stopping so a double-tap-to-stop can't immediately restart
 
 -- ─── Meeting mode (double-tap fn) ────────────────────────────────────────────
 -- Installed helper/script locations (install.sh copies the repo's helpers/bin
@@ -102,6 +103,7 @@ local meetingActive  = false
 local meetingDir     = nil
 local meetingTapTask = nil   -- capture-system.sh (system audio via Core Audio tap)
 local meetingMicTask = nil   -- ffmpeg (your mic)
+local meetingStoppedAt = 0
 
 -- Ensure working dirs exist at startup
 os.execute("mkdir -p " .. HISTORY_DIR)
@@ -643,12 +645,13 @@ end
 local function stopMeeting()
   if not meetingActive then return end
   meetingActive = false
+  meetingStoppedAt = hs.timer.secondsSinceEpoch()
   hideMeetingIndicator()
   if meetingMicTask then meetingMicTask:terminate(); meetingMicTask = nil end
   if meetingTapTask then meetingTapTask:terminate(); meetingTapTask = nil end  -- SIGTERM → wrapper finalises them.wav
   local dir = meetingDir
   showTranscribingIndicator()
-  hs.alert.show("Meeting stopped — transcribing…", 2)
+  hs.alert.show("Meeting ended - transcribing...", 2)
   -- Let ffmpeg + the tap wrapper finalise their WAVs, then process.
   hs.timer.doAfter(1.5, function()
     -- Warn if the mic channel came back silent (e.g. Bluetooth capture failure).
@@ -750,6 +753,9 @@ fnTap = hs.eventtap.new({
   end
 
   if sinceLast < DOUBLE_TAP_WINDOW then
+    if hs.timer.secondsSinceEpoch() - meetingStoppedAt < MEETING_RESTART_COOLDOWN then
+      return false
+    end
     cancelPendingTranscribe()
     if MEETING_AVAILABLE then
       -- Double-tap fn = MEETING mode. The first tap may have optimistically
