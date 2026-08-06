@@ -36,7 +36,9 @@ fi
 
 echo "→ Installing capture wrapper + pipeline scripts"
 cp "$REPO/helpers/bin/capture-system.sh" "$BIN/"
-cp "$REPO/scripts/meeting_transcribe.py" "$REPO/scripts/name_speakers.py" "$SCR/"
+cp "$REPO/scripts/meeting_transcribe.py" "$REPO/scripts/name_speakers.py" \
+   "$REPO/scripts/llm_diarise.py" "$REPO/scripts/semantic_attribution.py" \
+   "$REPO/scripts/calendar_roster.py" "$SCR/"
 chmod +x "$BIN"/* "$SCR"/*.py
 
 echo "→ Installing sherpa-onnx (speaker diarisation — Apache-2.0, no token, offline)"
