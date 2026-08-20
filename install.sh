@@ -255,6 +255,44 @@ if pgrep -x Hammerspoon >/dev/null; then
   osascript -e 'tell application "Hammerspoon" to quit' >/dev/null 2>&1 || true
   sleep 2
 fi
+
+# Register Hammerspoon to start at login BEFORE launching it.
+# Without this the tool works perfectly until the user's next restart and then
+# silently never comes back — nothing looks broken, there is just nothing
+# running. Cost us Lachlan Waugh's install on 2026-08-20 (macOS 26.6.2 update).
+# Keep in sync with scripts/autostart.sh, which is the same fix for people who
+# already installed before this existed.
+UT_LABEL="com.upscale.upscale-talk-autostart"
+UT_PLIST="$HOME/Library/LaunchAgents/$UT_LABEL.plist"
+mkdir -p "$HOME/Library/LaunchAgents"
+cat > "$UT_PLIST" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$UT_LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/open</string>
+        <string>-a</string>
+        <string>Hammerspoon</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+PLISTEOF
+if plutil -lint "$UT_PLIST" >/dev/null 2>&1; then
+  launchctl bootout "gui/$UID/$UT_LABEL" 2>/dev/null || true
+  launchctl bootstrap "gui/$UID" "$UT_PLIST" 2>/dev/null || true
+  echo "  Set to start automatically at login."
+else
+  rm -f "$UT_PLIST"
+  echo "  ⚠️  Couldn't set start-at-login. The tool will still work, but you'll"
+  echo "      need to re-open Hammerspoon after each restart."
+fi
+
 open -a Hammerspoon
 sleep 2
 

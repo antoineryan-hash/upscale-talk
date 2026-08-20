@@ -23,6 +23,11 @@ print(f"   Cleaned {p}")
 PY
 fi
 
+echo "→ Removing the start-at-login agent..."
+UT_LABEL="com.upscale.upscale-talk-autostart"
+launchctl bootout "gui/$UID/$UT_LABEL" 2>/dev/null || true
+rm -f "$HOME/Library/LaunchAgents/$UT_LABEL.plist"
+
 echo "→ Reloading Hammerspoon..."
 open -g "hammerspoon://reload" 2>/dev/null || true
 
