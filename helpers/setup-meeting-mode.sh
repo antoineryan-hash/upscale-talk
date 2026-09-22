@@ -34,12 +34,23 @@ else
   exit 1
 fi
 
-echo "→ Installing capture wrapper + pipeline scripts"
-cp "$REPO/helpers/bin/capture-system.sh" "$BIN/"
+echo "→ Installing capture wrappers + pipeline scripts"
+cp "$REPO/helpers/bin/capture-system.sh" "$REPO/helpers/bin/capture-mic.sh" \
+   "$REPO/helpers/bin/mic-loss-test.sh" "$BIN/"
 cp "$REPO/scripts/meeting_transcribe.py" "$REPO/scripts/name_speakers.py" \
    "$REPO/scripts/llm_diarise.py" "$REPO/scripts/semantic_attribution.py" \
    "$REPO/scripts/calendar_roster.py" "$SCR/"
 chmod +x "$BIN"/* "$SCR"/*.py
+
+# sox is optional. helpers/bin/mic-loss-test.sh measures both mic backends:
+# on this Mac ffmpeg's avfoundation input loses 10.8-11.1% of the samples over a
+# 20 second capture while sox loses 0.0%, which is why me.wav has always been
+# shorter than them.wav. capture-mic.sh still defaults to ffmpeg; set
+# UT_MIC_BACKEND=sox to switch once you have measured it on your own mic.
+if ! command -v rec >/dev/null 2>&1; then
+  echo "→ Installing sox (optional second mic backend, and the loss benchmark)"
+  brew install sox >/dev/null 2>&1 || echo "  sox not installed - mic-loss-test will skip that row"
+fi
 
 echo "→ Installing sherpa-onnx (speaker diarisation — Apache-2.0, no token, offline)"
 if /usr/bin/python3 -c "import sherpa_onnx, numpy" 2>/dev/null; then

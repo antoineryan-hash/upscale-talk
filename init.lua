@@ -14,7 +14,7 @@
 --          unchanged: prefers built-in over flaky Bluetooth, refuses to paste
 --          "you" on a silent capture, opt-in counts.
 
-local VERSION = "0.6.1"
+local VERSION = "0.6.2"
 pcall(function() require("hs.ipc") end)  -- enable the `hs` command-line tool (support/validation)
 local HOME    = os.getenv("HOME")
 local WAV     = "/tmp/upscale-talk.wav"
@@ -35,6 +35,11 @@ local VOICES_DIR   = HOME .. "/upscale-talk/voices"     -- reference voice libra
 local BIN_DIR      = HOME .. "/upscale-talk/bin"
 local SCRIPTS_DIR  = HOME .. "/upscale-talk/scripts"
 local TAP_CAPTURE  = BIN_DIR .. "/capture-system.sh"    -- audiotee → them.wav
+local MIC_CAPTURE  = BIN_DIR .. "/capture-mic.sh"       -- your mic → me.wav
+local MEETING_HEARTBEAT   = HOME .. "/upscale-talk/.heartbeat"
+-- Hard ceiling on one recording, enforced inside the capture wrappers so it
+-- survives Hammerspoon dying. Longest real meeting on disk is 77 minutes.
+local MEETING_MAX_SECONDS = 10800   -- 3 hours
 local MEETING_TRANSCRIBE = SCRIPTS_DIR .. "/meeting_transcribe.py"
 local NAME_SPEAKERS      = SCRIPTS_DIR .. "/name_speakers.py"
 local LLM_DIARISE        = SCRIPTS_DIR .. "/llm_diarise.py"
@@ -49,7 +54,14 @@ local MEETING_SPEAKERS = 2  -- people sharing ONE mic in-person (set 3+ for a bi
 -- locked hands-free dictation — so this same config is safe for colleagues who
 -- only ran the dictation one-liner.
 local MEETING_AVAILABLE = (hs.fs.attributes(TAP_CAPTURE) ~= nil)
+                          and (hs.fs.attributes(MIC_CAPTURE) ~= nil)
                           and (hs.fs.attributes(MEETING_TRANSCRIBE) ~= nil)
+
+-- A half-installed meeting mode is worse than none: the tap helper is there but
+-- the mic wrapper (and its duration cap) is not. Say so rather than silently
+-- reverting to dictation on a double-tap.
+local MEETING_NEEDS_UPDATE = (hs.fs.attributes(TAP_CAPTURE) ~= nil)
+                             and (hs.fs.attributes(MIC_CAPTURE) == nil)
 
 -- ─── Behaviour flags (safe to change) ────────────────────────────────────────
 -- Bluetooth mics (AirPods etc.) frequently open via avfoundation but deliver a
@@ -104,7 +116,15 @@ local meetingActive  = false
 local meetingDir     = nil
 local meetingTapTask = nil   -- capture-system.sh (system audio via Core Audio tap)
 local meetingMicTask = nil   -- ffmpeg (your mic)
+local meetingStartedAt = 0
 local meetingStoppedAt = 0
+-- Forward declaration. The menubar needs to call stopMeeting, and the menubar is
+-- built long before stopMeeting is defined. Until now the fn event tap was the
+-- ONLY caller of stopMeeting anywhere in this file, so a dead event tap meant a
+-- meeting that could not be stopped at all.
+local stopMeeting
+local meetingHeartbeat = nil  -- hs.timer keeping ~/upscale-talk/.heartbeat fresh
+local meetingFinaliseTimer = nil  -- held, like pendingTranscribeTimer, not left loose
 
 -- Ensure working dirs exist at startup
 os.execute("mkdir -p " .. HISTORY_DIR)
@@ -154,7 +174,7 @@ local function stopWrapperTask(task)
   local pid = task:pid()
   task:terminate()
   if not (pid and pid > 0) then return end
-  hs.timer.doAfter(3.0, function()
+  hs.timer.doAfter(2.0, function()
     if task:isRunning() then
       os.execute("kill -9 " .. pid .. " 2>/dev/null; true")
     end
@@ -313,6 +333,17 @@ local recentTranscriptions = {}  -- [{time = "HH:MM:SS", text = "..."}]
 local function refreshMenubar()
   if not menubar then return end
   local menu = {}
+  -- A second way out. If the fn event tap is dead (a revoked Accessibility
+  -- grant after a macOS update, or a wedged tap) this is the only thing that can
+  -- end a recording short of quitting Hammerspoon.
+  if meetingActive then
+    local mins = math.floor((hs.timer.secondsSinceEpoch() - meetingStartedAt) / 60)
+    table.insert(menu, {
+      title = "■  Stop meeting  (recording " .. mins .. " min)",
+      fn = function() if stopMeeting then stopMeeting() end end,
+    })
+    table.insert(menu, {title = "-"})
+  end
   if #recentTranscriptions == 0 then
     table.insert(menu, {title = "No transcriptions yet - hold fn to dictate", disabled = true})
   else
@@ -663,12 +694,22 @@ end
 local function startMeeting()
   if meetingActive or recording then return end
   meetingActive = true
+  meetingStartedAt = hs.timer.secondsSinceEpoch()
   local stamp = os.date("%Y-%m-%d_%H-%M-%S")
   meetingDir = MEETINGS_DIR .. "/" .. stamp
   os.execute(string.format("mkdir -p %q", meetingDir))
 
+  -- Heartbeat: both capture wrappers stop themselves if this goes stale, so a
+  -- meeting cannot outlive Hammerspoon or a stop path that never ran.
+  os.execute(string.format("touch %q", MEETING_HEARTBEAT))
+  meetingHeartbeat = hs.timer.doEvery(30, function()
+    os.execute(string.format("touch %q", MEETING_HEARTBEAT))
+  end)
+
   -- System audio (the far side) via the Core Audio tap wrapper.
-  meetingTapTask = hs.task.new("/bin/bash", nil, {TAP_CAPTURE, meetingDir .. "/them.wav"})
+  meetingTapTask = hs.task.new("/bin/bash", nil,
+    {TAP_CAPTURE, meetingDir .. "/them.wav",
+     tostring(MEETING_MAX_SECONDS), MEETING_HEARTBEAT})
   meetingTapTask:start()
 
   -- Your mic — honour the current default input (headset), don't force built-in.
@@ -677,35 +718,63 @@ local function startMeeting()
   -- (the pipeline detects that and falls back). ffmpeg errors if the device has
   -- fewer channels than asked, so probe channel support isn't needed: avfoundation
   -- upmixes a mono source to the requested 2 channels.
+  -- Run through capture-mic.sh rather than ffmpeg directly. The wrapper splits
+  -- capture from writing across a fifo, so however the capture is killed the
+  -- writer still sees EOF and finalises a valid WAV header - every me.wav before
+  -- this carried a placeholder size, which is what meeting_transcribe.py and
+  -- calendar_roster.py had to work around in 3854c2b. It also owns the duration
+  -- cap and the heartbeat guard.
   local mic = meetingMicDevice()
-  meetingMicTask = hs.task.new(FFMPEG, nil,
-    {"-f", "avfoundation", "-i", ":" .. mic,
-     "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "2", "-y", meetingDir .. "/me.wav"})
+  meetingMicTask = hs.task.new("/bin/bash", nil,
+    {MIC_CAPTURE, meetingDir .. "/me.wav", tostring(mic),
+     tostring(MEETING_MAX_SECONDS), MEETING_HEARTBEAT})
   meetingMicTask:start()
 
   showMeetingIndicator()
+  refreshMenubar()
   hs.alert.show("🔵 Meeting recording — tap fn once to stop", 2.5)
 end
 
-local function stopMeeting()
+function stopMeeting()
   if not meetingActive then return end
   meetingActive = false
   meetingStoppedAt = hs.timer.secondsSinceEpoch()
-  hideMeetingIndicator()
-  -- The mic: SIGTERM is ignored while ffmpeg reads avfoundation, so stopTask
-  -- SIGKILLs it by pid. Without this it records for hours after the meeting,
-  -- AND runMeetingPipeline below transcribes a WAV that is still being written,
-  -- which silently truncates the transcript to however much had been flushed at
-  -- that instant (23.1 min of a 28.8 min meeting, 2026-08-10). Reported again by
-  -- Marc Starrett 2026-09-22: 12m40s of run-on on 27 August.
-  stopTask(meetingMicTask); meetingMicTask = nil
-  -- The far side: SIGTERM only. capture-system.sh finalises them.wav in its trap.
-  stopWrapperTask(meetingTapTask); meetingTapTask = nil
   local dir = meetingDir
-  showTranscribingIndicator()
+  meetingDir = nil
+
+  -- Stop the capture FIRST, and under pcall.
+  --
+  -- This used to clear meetingActive and tear the indicator down BEFORE anything
+  -- was killed. An error in that teardown left both recordings running AND the
+  -- meeting unstoppable: with meetingActive already false, every later fn press
+  -- falls through to the dictation path, so there was no way back. Ordering the
+  -- kill first, and isolating it, means a UI failure can no longer cost a
+  -- recording.
+  --
+  -- Both captures are wrappers, so SIGTERM reaches their trap, which stops the
+  -- capture and waits for the writer to finalise a valid WAV. stopWrapperTask
+  -- escalates to SIGKILL after 2s if one is wedged.
+  local ok, err = pcall(function()
+    if meetingHeartbeat then meetingHeartbeat:stop(); meetingHeartbeat = nil end
+    stopWrapperTask(meetingMicTask); meetingMicTask = nil
+    stopWrapperTask(meetingTapTask); meetingTapTask = nil
+  end)
+  if not ok then
+    -- No pids to work with. Fall back to the wrapper names, politely, so their
+    -- traps still run and both WAVs still finalise.
+    os.execute("pkill -f 'capture-mic.sh' 2>/dev/null; pkill -f 'capture-system.sh' 2>/dev/null; true")
+    hs.printf("upscale-talk: stopMeeting cleanup failed (%s) - fell back to pkill", tostring(err))
+  end
+
+  pcall(hideMeetingIndicator)
+  pcall(showTranscribingIndicator)
+  pcall(refreshMenubar)
   hs.alert.show("Meeting ended - transcribing...", 2)
-  -- Let ffmpeg + the tap wrapper finalise their WAVs, then process.
-  hs.timer.doAfter(1.5, function()
+  -- Let both capture wrappers finalise their WAVs, then process. This has to
+  -- outlast stopWrapperTask's 2.0s escalation, or the pipeline can start reading
+  -- a WAV that is still being written - which is how a 28.8 minute meeting came
+  -- back as a 23.1 minute transcript with no error (2026-08-10).
+  meetingFinaliseTimer = hs.timer.doAfter(3.0, function()
     -- Warn if the mic channel came back silent (e.g. Bluetooth capture failure).
     -- The far side is captured via the tap regardless, so the meeting isn't lost.
     measureMaxDb(dir .. "/me.wav", function(maxDb)
@@ -809,6 +878,10 @@ fnTap = hs.eventtap.new({
       return false
     end
     cancelPendingTranscribe()
+    if MEETING_NEEDS_UPDATE then
+      hs.alert.show("Meeting mode needs updating.\nRun helpers/setup-meeting-mode.sh from the repo,\nthen reload Hammerspoon.", 6)
+      return false
+    end
     if MEETING_AVAILABLE then
       -- Double-tap fn = MEETING mode. The first tap may have optimistically
       -- started a hold-dictation; abandon it (WITHOUT transcribing) and start
@@ -848,3 +921,27 @@ end
 
 hs.alert.show("upscale-talk ready - hold fn to dictate, double-tap fn to " ..
   (MEETING_AVAILABLE and "record a meeting" or "lock on"), 2.5)
+
+-- ─── Support handle ──────────────────────────────────────────────────────────
+-- hs.ipc is already enabled at the top of this file, so `hs -c "..."` can reach
+-- anything exposed here. Everything else in this config is `local`, which meant
+-- the stop path could not be exercised at all except by a physical fn keypress -
+-- no test, no emergency stop, no way for a colleague to confirm a fix.
+--
+--   hs -c "utDebug.stop()"             end a meeting that will not end
+--   hs -c "utDebug.status()"           what this install is and what it is doing
+--   hs -c "utDebug.start()"            start a meeting without touching the keyboard
+--
+-- scripts/selftest-meeting.sh drives the whole stop path through these.
+utDebug = {
+  version  = VERSION,
+  start    = function() startMeeting() end,
+  stop     = function() stopMeeting() end,
+  status   = function()
+    return string.format(
+      "version=%s meeting_available=%s meeting_active=%s recording=%s dir=%s",
+      VERSION, tostring(MEETING_AVAILABLE), tostring(meetingActive),
+      tostring(recording), tostring(meetingDir))
+  end,
+  meetingActive = function() return meetingActive end,
+}
