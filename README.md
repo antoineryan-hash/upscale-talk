@@ -33,6 +33,21 @@ partway through because Homebrew reads from the same input stream.)
 warning, see "0 READ ME FIRST - if your Mac blocks the installer.txt" in the
 folder (the one-liner above avoids this entirely).
 
+Both routes run the same installer now. The double-click file is a small
+wrapper around `install.sh`, so it cannot fall behind it again. It used to be a
+separate copy, and by September 2026 it had drifted far enough that it never set
+up start-at-login - anyone who installed that way lost the tool at their next
+restart, with no error.
+
+**Is it working?** Paste this to get a short report you can send back:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/antoineryan-hash/upscale-talk/main/scripts/doctor.sh)"
+```
+
+It reads only. It tells you the version, whether start-at-login is actually
+registered, and whether any past recording ran on past its stop.
+
 The installer:
 1. Installs **Hammerspoon**, **whisper.cpp**, and **ffmpeg** via Homebrew
 2. Downloads (or reuses VoiceInk's existing) **large-v3-turbo Q5_0** Whisper model (~547 MB)

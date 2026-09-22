@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 #
-# Uninstall upscale-talk
+# Uninstall upscale-talk - double-clickable from Finder.
+#
+# A thin wrapper around uninstall.sh, for the same reason as the installer: this
+# file used to be a second copy, and it had drifted. It never removed the
+# start-at-login agent, so uninstalling by double-click left a LaunchAgent that
+# went on re-opening Hammerspoon at every login after the tool was gone.
 #
 set -euo pipefail
+
+RAW="https://raw.githubusercontent.com/antoineryan-hash/upscale-talk/main"
+HERE="$(cd "$(dirname "$0")" && pwd)"
 
 cat <<'BANNER'
 
@@ -12,58 +20,46 @@ cat <<'BANNER'
 
 This will remove:
   • The upscale-talk block from ~/.hammerspoon/init.lua
-  • The ~/upscale-talk/ folder (including transcription history)
-  • The /tmp working files
+  • The start-at-login agent
+  • The Whisper model and the helper scripts
 
-This will NOT remove (they may be used by other tools):
-  • Hammerspoon
-  • whisper.cpp
-  • ffmpeg
-  • macOS dictation / fn-key preference changes
+This will NOT remove:
+  • Your transcriptions and meeting recordings
+    (they stay in ~/upscale-talk/ - delete that folder yourself if you
+     want them gone)
+  • Hammerspoon, whisper.cpp, ffmpeg - other things may use them
 
 Press Enter to continue, or Ctrl-C to cancel.
 
 BANNER
 read -r
 
-echo "→ Removing upscale-talk Hammerspoon config block..."
-if [ -f ~/.hammerspoon/init.lua ]; then
-  python3 - <<'PY'
-import re, pathlib
-p = pathlib.Path.home() / ".hammerspoon" / "init.lua"
-text = p.read_text()
-new_text = re.sub(r"\n*-- ===== upscale-talk =====.*\Z", "", text, flags=re.DOTALL)
-new_text = re.sub(r"\n*-- upscale-talk:.*\Z", "", new_text, flags=re.DOTALL)
-p.write_text(new_text)
-print(f"   Cleaned {p}")
-PY
+finish() {
+  echo
+  echo "Press Enter to close..."
+  read -r
+}
+trap finish EXIT
+
+# Run with the real terminal on stdin when there is one. Double-clicked from
+# Finder there always is; piped in a test harness there may not be, and
+# redirecting from a /dev/tty that cannot be opened kills the script.
+run_script() {
+  if ( exec 3< /dev/tty ) 2>/dev/null; then
+    bash "$1" < /dev/tty
+  else
+    bash "$1"
+  fi
+}
+
+if [ -f "$HERE/files/uninstall.sh" ]; then
+  run_script "$HERE/files/uninstall.sh"
+else
+  TMP="$(mktemp)"
+  if ! curl -fsSL "$RAW/uninstall.sh" -o "$TMP"; then
+    echo "❌ Couldn't download the uninstaller. Check your internet connection."
+    exit 1
+  fi
+  run_script "$TMP"
+  rm -f "$TMP"
 fi
-
-echo "→ Reloading Hammerspoon..."
-open -g "hammerspoon://reload" 2>/dev/null || true
-
-echo "→ Removing ~/upscale-talk/ (model + history)..."
-rm -rf ~/upscale-talk
-
-echo "→ Cleaning /tmp..."
-rm -f /tmp/upscale-talk*.wav /tmp/upscale-talk-diag.log
-
-cat <<'DONE'
-
-✅ Uninstalled.
-
-If you want to also remove Hammerspoon, whisper.cpp, or ffmpeg, run:
-  brew uninstall --cask hammerspoon
-  brew uninstall whisper-cpp
-  brew uninstall ffmpeg
-
-If you want to restore the macOS fn-key + dictation behaviour:
-  defaults delete com.apple.HIToolbox AppleFnUsageType
-  defaults delete com.apple.HIToolbox AppleDictationAutoEnable
-  killall -HUP cfprefsd
-
-You can close this window now.
-
-DONE
-echo "Press Enter to close..."
-read -r

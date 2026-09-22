@@ -19,6 +19,10 @@ DEST="$HOME/upscale-talk"
 MEET="$DEST/meetings"
 HS="/opt/homebrew/bin/hs"
 [ -x "$HS" ] || HS="$(command -v hs)"
+# ALWAYS give hs a closed stdin. With stdin left open and not a terminal, the hs
+# CLI waits on it forever - the script then hangs before printing anything,
+# which looks exactly like a broken tool. Cost me six minutes to find.
+hs_run() { "$HS" -c "$1" < /dev/null 2>/dev/null; }
 PASS=0; FAIL=0
 ok()   { printf "  PASS  %s\n" "$1"; PASS=$((PASS+1)); }
 bad()  { printf "  FAIL  %s\n" "$1"; FAIL=$((FAIL+1)); }
@@ -36,16 +40,16 @@ except Exception: print('-1 -1')" "$1"; }
 if [ -z "${HS:-}" ] || [ ! -x "$HS" ]; then
   echo "hs command-line tool not found. In Hammerspoon: Preferences > install 'hs'."; exit 2
 fi
-if ! "$HS" -c "utDebug.version" >/dev/null 2>&1; then
+if ! hs_run "utDebug.version" >/dev/null; then
   echo "utDebug is not exposed. Reload Hammerspoon on v0.6.2 or later."; exit 2
 fi
 
-echo "upscale-talk meeting self-test  (config $("$HS" -c "utDebug.version" 2>/dev/null | tr -d '\r'))"
+echo "upscale-talk meeting self-test  (config $(hs_run "utDebug.version" | tr -d '\r'))"
 echo
 
 # ─── 1. start ────────────────────────────────────────────────────────────────
 BEFORE="$(ls -1 "$MEET" 2>/dev/null | wc -l | tr -d ' ')"
-"$HS" -c "utDebug.start()" >/dev/null 2>&1
+hs_run "utDebug.start()" >/dev/null
 sleep 10
 DIR="$(ls -1dt "$MEET"/*/ 2>/dev/null | head -1)"; DIR="${DIR%/}"
 AFTER="$(ls -1 "$MEET" 2>/dev/null | wc -l | tr -d ' ')"
@@ -60,7 +64,7 @@ TAPPID="$(pgrep -f "capture-system.sh $DIR" | head -1)"
                  || bad "tap not running - check Hammerspoon's audio recording permission"
 
 # ─── 2. stop, and time it ────────────────────────────────────────────────────
-"$HS" -c "utDebug.stop()" >/dev/null 2>&1
+hs_run "utDebug.stop()" >/dev/null
 T0=$(python3 -c "import time;print(time.time())")
 GONE=""
 for _ in $(seq 1 40); do
@@ -89,25 +93,39 @@ for f in me them; do
   fi
 done
 
-# ─── 4. cross-kill: a dictation must not kill a running transcription ────────
-mkdir -p "$DIR"
-/opt/homebrew/bin/ffmpeg -loglevel error -f lavfi -i "sine=f=440:d=25" \
-    -ar 16000 -ac 1 -y "$DIR/crosskill-probe.wav" >/dev/null 2>&1 &
+# ─── 4. cross-kill: the kill patterns must not match anything else ───────────
+# Deterministic rather than timing-based: start a long ffmpeg inside a meetings
+# folder, exactly like the post-meeting pipeline's own to_mono and volumedetect
+# calls, and assert none of the patterns this config still uses would match it.
+# The old pattern, 'ffmpeg.*upscale-talk', matched all of them - so stopping a
+# dictation while a meeting was transcribing killed the transcription, for the
+# 18 to 29 minutes that takes.
+PROBEWAV="$DIR/crosskill-probe.wav"
+/opt/homebrew/bin/ffmpeg -loglevel error -re -f lavfi -i "sine=f=440:d=30" \
+    -ar 16000 -ac 1 -y "$PROBEWAV" >/dev/null 2>&1 &
 PROBE=$!
 sleep 1
 if kill -0 "$PROBE" 2>/dev/null; then
-  "$HS" -c "utDebug.stop()" >/dev/null 2>&1   # a no-op stop runs the same kills
-  sleep 1
-  if kill -0 "$PROBE" 2>/dev/null; then
-    ok "a stop does not kill unrelated ffmpeg work in a meetings folder"
+  HITS=0
+  for pat in 'ffmpeg.*/tmp/upscale-talk.wav' 'ffmpeg.*upscale-talk/meetings/.*/me.wav'; do
+    if pgrep -f "$pat" 2>/dev/null | grep -qx "$PROBE"; then
+      bad "pattern '$pat' matches an unrelated pipeline ffmpeg"
+      HITS=$((HITS+1))
+    fi
+  done
+  # And prove the old pattern DID match it, so this test is meaningful.
+  if pgrep -f 'ffmpeg.*upscale-talk' 2>/dev/null | grep -qx "$PROBE"; then
+    OLDHIT="yes"
   else
-    bad "a stop SIGKILLed an unrelated ffmpeg - the kill pattern is too broad"
+    OLDHIT="no"
   fi
-  kill -9 "$PROBE" 2>/dev/null
+  [ "$HITS" -eq 0 ] && ok "no kill pattern matches unrelated ffmpeg work in a meetings folder"
+  [ "$OLDHIT" = "yes" ] && note "(the pre-0.6.2 pattern did match it - that was the bug)"
+  { kill -9 "$PROBE"; wait "$PROBE"; } 2>/dev/null   # braces: no job-control noise
 else
   note "cross-kill probe did not start; skipped"
 fi
-rm -f "$DIR/crosskill-probe.wav"
+rm -f "$PROBEWAV"
 
 # ─── 5. the cap, without waiting 3 hours ─────────────────────────────────────
 if [ "${1:-}" = "--cap" ]; then
@@ -115,10 +133,15 @@ if [ "${1:-}" = "--cap" ]; then
   echo "  cap test: 20s capture, heartbeat abandoned after 5s"
   HB="$(mktemp)"; OUT="$(mktemp -d)/cap.wav"
   touch "$HB"
-  bash "$DEST/bin/capture-mic.sh" "$OUT" 1 600 "$HB" &
+  bash "$DEST/bin/capture-mic.sh" "$OUT" 1 600 "$HB" >/dev/null 2>&1 &
   CAPPID=$!
   S=$(python3 -c "import time;print(time.time())")
-  wait $CAPPID 2>/dev/null
+  # Poll rather than wait: a wedged wrapper must fail this test, not hang it.
+  for _ in $(seq 1 160); do
+    kill -0 "$CAPPID" 2>/dev/null || break
+    sleep 1
+  done
+  kill -9 "$CAPPID" 2>/dev/null
   E=$(python3 -c "import time;print('%.0f'%(time.time()-$S))")
   if [ "$E" -lt 130 ]; then
     ok "capture stopped itself after ${E}s with a stale heartbeat (cap was 600s)"

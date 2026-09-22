@@ -31,8 +31,24 @@ rm -f "$HOME/Library/LaunchAgents/$UT_LABEL.plist"
 echo "→ Reloading Hammerspoon..."
 open -g "hammerspoon://reload" 2>/dev/null || true
 
-echo "→ Removing ~/upscale-talk/ (model + tmp)..."
-rm -rf ~/upscale-talk
+# Keep what cannot be regenerated. The model is a 547 MB download and the bin/
+# scripts come from the repo, but transcriptions and meeting recordings exist
+# nowhere else. Retiring the tool should not destroy someone's record of it.
+echo "→ Removing ~/upscale-talk/ (model, helpers, scripts)..."
+KEEP="$HOME/upscale-talk"
+if [ -d "$KEEP" ]; then
+  rm -rf "$KEEP/models" "$KEEP/bin" "$KEEP/scripts" "$KEEP/voices" \
+         "$KEEP/telemetry.conf" "$KEEP/.heartbeat"
+  if [ -d "$KEEP/history" ] || [ -d "$KEEP/meetings" ] || [ -d "$KEEP/archive" ]; then
+    echo "   Kept your transcriptions: $KEEP/{history,meetings,archive}"
+    echo "   Delete that folder yourself if you want it gone."
+  else
+    rmdir "$KEEP" 2>/dev/null || true
+  fi
+fi
+
+echo "→ Cleaning /tmp..."
+rm -f /tmp/upscale-talk*.wav /tmp/upscale-talk-diag.log
 
 echo
 echo "✅ Uninstall complete."

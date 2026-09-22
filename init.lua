@@ -330,6 +330,51 @@ end
 local menubar = nil
 local recentTranscriptions = {}  -- [{time = "HH:MM:SS", text = "..."}]
 
+-- Count meetings that hold audio but never produced a transcript. Before
+-- v0.6.2 an interrupted meeting vanished silently: meetingDir is a module local
+-- that dies with the process, so nothing ever mentioned it again. This is the
+-- visible half of the duration cap - a capped meeting surfaces here rather than
+-- disappearing.
+local updateAvailable  -- set by the once-a-day version check near the bottom
+local function unfinishedMeetings()
+  local n, bytes = 0, 0
+  local h = io.popen("ls -1 " .. MEETINGS_DIR .. " 2>/dev/null")
+  if not h then return 0, 0 end
+  for name in h:lines() do
+    local dir = MEETINGS_DIR .. "/" .. name
+    if hs.fs.attributes(dir .. "/transcript.txt") == nil then
+      local size = 0
+      for _, w in ipairs({"me.wav", "them.wav"}) do
+        local a = hs.fs.attributes(dir .. "/" .. w)
+        if a then size = size + a.size end
+      end
+      if size > 0 then n = n + 1; bytes = bytes + size end
+    end
+  end
+  h:close()
+  return n, bytes
+end
+
+-- What this install is and what it is doing. Goes in the clipboard and in the
+-- feedback email; nothing here is a transcript or a word of anyone's audio.
+local function diagnostics()
+  local unfin = unfinishedMeetings()
+  local agent = "no"
+  local h = io.popen("launchctl list 2>/dev/null | grep -c upscale-talk-autostart")
+  if h then if (tonumber(h:read("*a")) or 0) > 0 then agent = "yes" end; h:close() end
+  local osv = "?"
+  local o = io.popen("sw_vers -productVersion 2>/dev/null")
+  if o then osv = (o:read("*l") or "?"); o:close() end
+  return table.concat({
+    "upscale-talk " .. VERSION,
+    "macOS " .. osv,
+    "start at login: " .. agent,
+    "meeting mode: " .. (MEETING_AVAILABLE and "yes" or "no"),
+    "meetings with no transcript: " .. tostring(unfin),
+    "", "--- what happened? ---", "",
+  }, "\n")
+end
+
 local function refreshMenubar()
   if not menubar then return end
   local menu = {}
@@ -391,6 +436,59 @@ local function refreshMenubar()
     title = "Open History Folder…",
     fn = function() hs.execute("open " .. HISTORY_DIR) end,
   })
+
+  local unfin, unfinBytes = unfinishedMeetings()
+  if unfin > 0 then
+    table.insert(menu, {
+      title = string.format("⚠️  %d meeting%s never transcribed (%.1f GB)…",
+                            unfin, unfin == 1 and "" or "s", unfinBytes / 1e9),
+      fn = function() hs.execute("open " .. MEETINGS_DIR) end,
+    })
+  end
+
+  -- Every tool gets a way to report a problem. This one has no web page, so it
+  -- opens a pre-filled email instead of posting anywhere: nothing leaves the Mac
+  -- until the person presses send, and the body is only the lines below - no
+  -- transcript, no audio, no history.
+  table.insert(menu, {title = "-"})
+  table.insert(menu, {
+    title = "Report a problem…",
+    fn = function()
+      local body = diagnostics()
+      hs.pasteboard.setContents(body)
+      local url = "mailto:antoine@up-scale.me?subject=" ..
+        hs.http.encodeForQuery("upscale-talk " .. VERSION .. " - " .. (hs.host.localizedName() or "")) ..
+        "&body=" .. hs.http.encodeForQuery(body)
+      local opened = hs.urlevent.openURL(url)
+      if not opened then
+        hs.alert.show("Couldn't open your mail app.\nDiagnostics copied - email antoine@up-scale.me", 6)
+      end
+    end,
+  })
+  table.insert(menu, {
+    title = "Copy diagnostics",
+    fn = function()
+      hs.pasteboard.setContents(diagnostics())
+      hs.alert.show("📋 Diagnostics copied", 1)
+    end,
+  })
+  if updateAvailable then
+    table.insert(menu, {
+      title = "⬆︎  Update available (" .. updateAvailable .. ") - click to copy the command",
+      fn = function()
+        local cmd = 'bash -c "$(curl -fsSL https://raw.githubusercontent.com/' ..
+                    'antoineryan-hash/upscale-talk/main/install.sh)"'
+        hs.pasteboard.setContents(cmd)
+        hs.alert.show("📋 Copied. Paste it into Terminal and press Enter.", 4)
+      end,
+    })
+  end
+  table.insert(menu, {
+    title = "upscale-talk " .. VERSION ..
+            (MEETING_AVAILABLE and "  ·  meeting mode on" or ""),
+    disabled = true,
+  })
+
   menubar:setMenu(menu)
 end
 
@@ -922,6 +1020,82 @@ end
 hs.alert.show("upscale-talk ready - hold fn to dictate, double-tap fn to " ..
   (MEETING_AVAILABLE and "record a meeting" or "lock on"), 2.5)
 
+-- ─── Start at login: repair it if it is missing ──────────────────────────────
+-- The agent was added to install.sh on 2026-08-20 and never to the
+-- double-click installer, so every zip install lost the tool at its next
+-- restart with no error. Tom Gibson's "mine's not working" on 13 August was
+-- almost certainly this. The remedy shipped that day was a one-liner sent to
+-- eight people, and exactly one machine was ever confirmed.
+--
+-- So repair it here instead of asking. Idempotent, same plist install.sh
+-- writes, and it runs once per Hammerspoon load. Delete the agent AND create
+-- ~/upscale-talk/.no-autostart if you want it to stay gone.
+local function ensureAutostart()
+  local label = "com.upscale.upscale-talk-autostart"
+  local plist = HOME .. "/Library/LaunchAgents/" .. label .. ".plist"
+  if hs.fs.attributes(HOME .. "/upscale-talk/.no-autostart") ~= nil then return end
+  if hs.fs.attributes(plist) ~= nil then return end
+
+  local xml = [[<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>]] .. label .. [[</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/open</string>
+        <string>-a</string>
+        <string>Hammerspoon</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+]]
+  os.execute(string.format("mkdir -p %q", HOME .. "/Library/LaunchAgents"))
+  local f = io.open(plist, "w")
+  if not f then return end
+  f:write(xml); f:close()
+
+  -- Lint before loading it, and remove it again if it is not valid, rather
+  -- than leaving a broken plist behind.
+  if os.execute(string.format("plutil -lint %q >/dev/null 2>&1", plist)) then
+    os.execute(string.format(
+      "launchctl bootout gui/$(id -u)/%s >/dev/null 2>&1; " ..
+      "launchctl bootstrap gui/$(id -u) %q >/dev/null 2>&1; true", label, plist))
+    hs.printf("upscale-talk: start-at-login was missing; installed %s", label)
+  else
+    os.remove(plist)
+  end
+end
+ensureAutostart()
+
+-- ─── Is there a newer version? ───────────────────────────────────────────────
+-- Reads one public file. No name, no token, nothing identifying is sent, and
+-- nothing updates itself - it only tells you the command to run. Set
+-- updates=off in ~/upscale-talk/telemetry.conf to skip it.
+local function checkForUpdate()
+  local conf = io.open(HOME .. "/upscale-talk/telemetry.conf", "r")
+  if conf then
+    local body = conf:read("*a") or ""; conf:close()
+    if body:find("updates%s*=%s*off") then return end
+  end
+  hs.http.asyncGet(
+    "https://raw.githubusercontent.com/antoineryan-hash/upscale-talk/main/VERSION",
+    nil,
+    function(status, body)
+      if status ~= 200 or not body then return end
+      local latest = body:gsub("%s", "")
+      if latest ~= "" and latest ~= VERSION then
+        updateAvailable = latest
+        refreshMenubar()
+      end
+    end)
+end
+hs.timer.doAfter(45, checkForUpdate)
+hs.timer.doEvery(24 * 3600, checkForUpdate)
+
 -- ─── Support handle ──────────────────────────────────────────────────────────
 -- hs.ipc is already enabled at the top of this file, so `hs -c "..."` can reach
 -- anything exposed here. Everything else in this config is `local`, which meant
@@ -944,4 +1118,7 @@ utDebug = {
       tostring(recording), tostring(meetingDir))
   end,
   meetingActive = function() return meetingActive end,
+  -- Same text the menubar's "Copy diagnostics" produces, so it can be checked
+  -- from the command line without clicking anything.
+  diagnostics   = function() return diagnostics() end,
 }

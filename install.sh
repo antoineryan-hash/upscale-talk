@@ -180,9 +180,18 @@ echo ""
 echo "→ Step 4/7: Installing the engine config..."
 mkdir -p ~/.hammerspoon
 
-# Fetch the current init.lua straight from GitHub (no local files in a one-liner install)
+# Prefer an init.lua bundled next to this script (the zip ships files/init.lua),
+# otherwise fetch the current one from GitHub. A one-liner install has no local
+# files; a double-click install does, and it should use what it downloaded
+# rather than silently mixing a zip with whatever is on main today.
 INIT_LUA="/tmp/upscale-talk-init.lua"
-curl -fsSL "$RAW/init.lua" -o "$INIT_LUA"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo "")"
+if [ -n "$HERE" ] && [ -f "$HERE/init.lua" ]; then
+  cp "$HERE/init.lua" "$INIT_LUA"
+  echo "  using the init.lua bundled with this download"
+else
+  curl -fsSL "$RAW/init.lua" -o "$INIT_LUA"
+fi
 
 if [ -f ~/.hammerspoon/init.lua ] && grep -q "upscale-talk" ~/.hammerspoon/init.lua; then
   echo "  upscale-talk already in your Hammerspoon config - replacing it with the latest version..."
@@ -286,7 +295,16 @@ PLISTEOF
 if plutil -lint "$UT_PLIST" >/dev/null 2>&1; then
   launchctl bootout "gui/$UID/$UT_LABEL" 2>/dev/null || true
   launchctl bootstrap "gui/$UID" "$UT_PLIST" 2>/dev/null || true
-  echo "  Set to start automatically at login."
+  # Verify, do not assume. A plist that lints can still fail to bootstrap, and
+  # this message used to print either way - which is why the 2026-08-20 fix was
+  # confirmed on one machine out of eight.
+  if launchctl print "gui/$UID/$UT_LABEL" >/dev/null 2>&1; then
+    echo "  Set to start automatically at login."
+  else
+    echo "  ⚠️  The start-at-login agent did not register."
+    echo "      upscale-talk will still work now, but it will not come back"
+    echo "      after a restart. Tell Antoine (antoine@up-scale.me)."
+  fi
 else
   rm -f "$UT_PLIST"
   echo "  ⚠️  Couldn't set start-at-login. The tool will still work, but you'll"
