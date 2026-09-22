@@ -550,24 +550,18 @@ def main(argv=None):
             f"had {acoustic_speaker_count} - check {output_path} before trusting it"
         )
 
+    # --as-primary makes the LLM pass THE Downloads handoff file, replacing the
+    # raw copy meeting_transcribe dropped — so skip the "(llm)" duplicate: one
+    # Downloads file per meeting. The raw always survives in the meeting folder.
+    suffix = ".txt" if args.as_primary else " (llm).txt"
     downloads_path = os.path.join(
         os.path.expanduser("~/Downloads"),
         "upscale-talk meeting "
         + os.path.basename(os.path.normpath(meeting_dir))
-        + " (llm).txt",
+        + suffix,
     )
     if not safe_write(downloads_path, combined):
         return 0
-
-    if args.as_primary:
-        primary_downloads_path = os.path.join(
-            os.path.expanduser("~/Downloads"),
-            "upscale-talk meeting "
-            + os.path.basename(os.path.normpath(meeting_dir))
-            + ".txt",
-        )
-        if not safe_write(primary_downloads_path, combined):
-            return 0
 
     remove_files(chunk_output_paths)
     counts_text = ", ".join(
