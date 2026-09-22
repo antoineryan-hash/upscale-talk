@@ -114,10 +114,52 @@ os.execute(string.format("mkdir -p %q %q", MEETINGS_DIR, VOICES_DIR))
 -- ffmpeg is actually capturing. User waits for the dot to appear, then talks.)
 
 -- Kill any orphan ffmpeg processes left from a previous Hammerspoon session
--- (cold-restart can detach our child ffmpeg, leaving it recording forever)
-os.execute("pkill -9 -f 'ffmpeg.*upscale-talk' 2>/dev/null; true")
+-- (cold-restart can detach our child ffmpeg, leaving it recording forever).
+-- Scoped to the two CAPTURE outputs. The old pattern 'ffmpeg.*upscale-talk'
+-- also matched every ffmpeg inside meeting_transcribe.py, so a Hammerspoon
+-- reload during a post-meeting transcription used to kill the transcription.
+os.execute("pkill -9 -f 'ffmpeg.*/tmp/upscale-talk.wav' 2>/dev/null; true")
+os.execute("pkill -9 -f 'ffmpeg.*upscale-talk/meetings/.*/me.wav' 2>/dev/null; true")
 -- Same for any orphaned meeting capture (system-audio tap) from a previous run
 os.execute("pkill -9 -f 'capture-system.sh' 2>/dev/null; pkill -9 -f 'helpers/bin/audiotee' 2>/dev/null; pkill -9 -f 'upscale-talk/bin/audiotee' 2>/dev/null; true")
+
+-- ─── Stopping a capture ──────────────────────────────────────────────────────
+-- terminate() sends SIGTERM, which ffmpeg IGNORES while it is reading from
+-- avfoundation (see 3356c24, 17 May). So follow it with SIGKILL on the task's
+-- OWN pid.
+--
+-- By pid, never by name. 'ffmpeg.*upscale-talk' also matched the system-audio
+-- wrapper's ffmpeg (its argv holds .../them.wav), measureMaxDb's ffmpeg, and
+-- every ffmpeg inside meeting_transcribe.py - so stopping a dictation while a
+-- meeting was still transcribing SIGKILLed the transcription, and a kill fired
+-- at stop time raced the wrapper that has to finalise them.wav cleanly.
+local function stopTask(task)
+  if not task then return end
+  local running = task:isRunning()
+  local pid = task:pid()
+  task:terminate()
+  -- Only signal a pid we know was live a moment ago. pid() keeps returning the
+  -- number after a task has exited, and blind-killing a stale pid can hit an
+  -- unrelated process that inherited it.
+  if running and pid and pid > 0 then
+    os.execute("kill -9 " .. pid .. " 2>/dev/null; true")
+  end
+end
+
+-- The system-audio wrapper finalises them.wav inside its SIGTERM trap, so it
+-- must be allowed to exit on its own. Escalate only if it is still alive well
+-- after the trap should have run.
+local function stopWrapperTask(task)
+  if not task then return end
+  local pid = task:pid()
+  task:terminate()
+  if not (pid and pid > 0) then return end
+  hs.timer.doAfter(3.0, function()
+    if task:isRunning() then
+      os.execute("kill -9 " .. pid .. " 2>/dev/null; true")
+    end
+  end)
+end
 
 -- ─── Indicator anchor (top-right of screen, just below menubar) ──────────────
 local INDICATOR_SIZE   = 22
@@ -459,14 +501,11 @@ local function stopRec()
   recording = false
   toggleMode = false
   if releaseWatchdog then releaseWatchdog:stop(); releaseWatchdog = nil end
-  if recordingTask then
-    recordingTask:terminate()
-    recordingTask = nil
-  end
-  -- Belt-and-suspenders: if terminate() didn't actually kill ffmpeg (happens
-  -- if the task was orphaned by a Hammerspoon restart), force-kill it via
-  -- shell. Without this, ffmpeg keeps recording silence into the WAV forever.
-  os.execute("pkill -9 -f 'ffmpeg.*upscale-talk' 2>/dev/null; true")
+  stopTask(recordingTask)
+  recordingTask = nil
+  -- Orphan sweep for a capture left by a PREVIOUS Hammerspoon session, where
+  -- there is no pid to target. Scoped to the dictation WAV.
+  os.execute("pkill -9 -f 'ffmpeg.*/tmp/upscale-talk.wav' 2>/dev/null; true")
   cancelReadyPoll()
   hideRecordingIndicator()
   showTranscribingIndicator()
@@ -653,16 +692,15 @@ local function stopMeeting()
   meetingActive = false
   meetingStoppedAt = hs.timer.secondsSinceEpoch()
   hideMeetingIndicator()
-  if meetingMicTask then meetingMicTask:terminate(); meetingMicTask = nil end
-  if meetingTapTask then meetingTapTask:terminate(); meetingTapTask = nil end  -- SIGTERM → wrapper finalises them.wav
-  -- Belt-and-suspenders, same as stopRec(): ffmpeg IGNORES SIGTERM while reading
-  -- from avfoundation, so terminate() above does NOT stop the mic. Without this it
-  -- records for hours after the meeting, AND runMeetingPipeline below transcribes a
-  -- WAV that is still being written — which silently truncates the transcript to
-  -- however much had been flushed at that instant. See commit 3356c24 (17 May), the
-  -- same bug fixed for dictation. Regressed into meeting mode 2026-07-27, found
-  -- 2026-08-10 (23.1 min transcribed of a 28.8 min meeting).
-  os.execute("pkill -9 -f 'ffmpeg.*upscale-talk' 2>/dev/null; true")
+  -- The mic: SIGTERM is ignored while ffmpeg reads avfoundation, so stopTask
+  -- SIGKILLs it by pid. Without this it records for hours after the meeting,
+  -- AND runMeetingPipeline below transcribes a WAV that is still being written,
+  -- which silently truncates the transcript to however much had been flushed at
+  -- that instant (23.1 min of a 28.8 min meeting, 2026-08-10). Reported again by
+  -- Marc Starrett 2026-09-22: 12m40s of run-on on 27 August.
+  stopTask(meetingMicTask); meetingMicTask = nil
+  -- The far side: SIGTERM only. capture-system.sh finalises them.wav in its trap.
+  stopWrapperTask(meetingTapTask); meetingTapTask = nil
   local dir = meetingDir
   showTranscribingIndicator()
   hs.alert.show("Meeting ended - transcribing...", 2)
@@ -779,8 +817,7 @@ fnTap = hs.eventtap.new({
         recording = false
         toggleMode = false
         if releaseWatchdog then releaseWatchdog:stop(); releaseWatchdog = nil end
-        if recordingTask then recordingTask:terminate(); recordingTask = nil end
-        os.execute("pkill -9 -f 'ffmpeg.*upscale-talk' 2>/dev/null; true")
+        stopTask(recordingTask); recordingTask = nil
         cancelReadyPoll()
         hideRecordingIndicator()
         os.remove(WAV)
