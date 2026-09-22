@@ -655,6 +655,14 @@ local function stopMeeting()
   hideMeetingIndicator()
   if meetingMicTask then meetingMicTask:terminate(); meetingMicTask = nil end
   if meetingTapTask then meetingTapTask:terminate(); meetingTapTask = nil end  -- SIGTERM → wrapper finalises them.wav
+  -- Belt-and-suspenders, same as stopRec(): ffmpeg IGNORES SIGTERM while reading
+  -- from avfoundation, so terminate() above does NOT stop the mic. Without this it
+  -- records for hours after the meeting, AND runMeetingPipeline below transcribes a
+  -- WAV that is still being written — which silently truncates the transcript to
+  -- however much had been flushed at that instant. See commit 3356c24 (17 May), the
+  -- same bug fixed for dictation. Regressed into meeting mode 2026-07-27, found
+  -- 2026-08-10 (23.1 min transcribed of a 28.8 min meeting).
+  os.execute("pkill -9 -f 'ffmpeg.*upscale-talk' 2>/dev/null; true")
   local dir = meetingDir
   showTranscribingIndicator()
   hs.alert.show("Meeting ended - transcribing...", 2)
