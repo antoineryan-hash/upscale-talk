@@ -6,6 +6,10 @@
 -- via the 🎤 menubar icon (click to copy to clipboard).
 -- Free, local-only Whisper dictation + meeting transcription for macOS.
 -- https://github.com/antoineryan-hash/upscale-talk
+-- v0.6.3 - a meeting stop can no longer freeze Hammerspoon (the capture
+--          wrappers let go of hs.task's pipes), fn only counts when the fn
+--          key itself goes down (a paste made while fn was held used to start
+--          AND stop a meeting), and a meeting under 2 s is skipped with an alert.
 -- v0.6.1 - self-heals Whisper repetition-loop hallucinations: if a dictation
 --          comes back looped, it auto re-transcribes once with -mc 0 (the fix)
 --          before pasting. Plus v0.6.0 meeting mode (Core Audio tap for system
@@ -14,7 +18,7 @@
 --          unchanged: prefers built-in over flaky Bluetooth, refuses to paste
 --          "you" on a silent capture, opt-in counts.
 
-local VERSION = "0.6.2"
+local VERSION = "0.6.3"
 pcall(function() require("hs.ipc") end)  -- enable the `hs` command-line tool (support/validation)
 local HOME    = os.getenv("HOME")
 local WAV     = "/tmp/upscale-talk.wav"
@@ -26,6 +30,8 @@ local HISTORY_DIR    = HOME .. "/upscale-talk/history"
 local HISTORY_MAX    = 20      -- entries shown in menubar
 local DOUBLE_TAP_WINDOW = 0.4
 local MEETING_RESTART_COOLDOWN = 2.0  -- seconds; ignore fn taps just after stopping so a double-tap-to-stop can't immediately restart
+local MEETING_STOP_GRACE = 1.0  -- seconds; ignore fn taps just after starting, the mirror of the cooldown above
+local MEETING_MIN_SECONDS = 2.0 -- a meeting shorter than this recorded nothing worth transcribing
 
 -- ─── Meeting mode (double-tap fn) ────────────────────────────────────────────
 -- Installed helper/script locations (install.sh copies the repo's helpers/bin
@@ -169,16 +175,29 @@ end
 -- The system-audio wrapper finalises them.wav inside its SIGTERM trap, so it
 -- must be allowed to exit on its own. Escalate only if it is still alive well
 -- after the trap should have run.
+--
+-- Escalation kills the wrapper's whole PROCESS GROUP, not just its pid. hs.task
+-- makes every task a group leader (pgid == pid, checked 2026-09-28), and
+-- terminate() already signals that group. Killing only the wrapper pid (as
+-- before 0.6.3) orphaned its writer ffmpeg, still blocked on the fifo. On
+-- 2026-09-28 that orphan held the task's stdout pipe, which hs.task reads to EOF
+-- on the main thread, so Hammerspoon froze until Antoine force quit it. The
+-- 0.6.3 wrappers detach from those pipes themselves; this is the second line of
+-- defence, and the one that protects a Mac still running the older wrappers.
+local escalationTimers = {}  -- held so they cannot be garbage collected unfired
 local function stopWrapperTask(task)
   if not task then return end
   local pid = task:pid()
   task:terminate()
   if not (pid and pid > 0) then return end
-  hs.timer.doAfter(2.0, function()
+  local t
+  t = hs.timer.doAfter(2.0, function()
+    escalationTimers[t] = nil
     if task:isRunning() then
-      os.execute("kill -9 " .. pid .. " 2>/dev/null; true")
+      os.execute(string.format("kill -9 -- -%d 2>/dev/null; kill -9 %d 2>/dev/null; true", pid, pid))
     end
   end)
+  escalationTimers[t] = true
 end
 
 -- ─── Indicator anchor (top-right of screen, just below menubar) ──────────────
@@ -342,7 +361,8 @@ local function unfinishedMeetings()
   if not h then return 0, 0 end
   for name in h:lines() do
     local dir = MEETINGS_DIR .. "/" .. name
-    if hs.fs.attributes(dir .. "/transcript.txt") == nil then
+    if hs.fs.attributes(dir .. "/transcript.txt") == nil
+       and hs.fs.attributes(dir .. "/too-short.txt") == nil then
       local size = 0
       for _, w in ipairs({"me.wav", "them.wav"}) do
         local a = hs.fs.attributes(dir .. "/" .. w)
@@ -865,6 +885,24 @@ function stopMeeting()
   end
 
   pcall(hideMeetingIndicator)
+
+  -- Nothing to transcribe. Most of these were never meant to be meetings (19 of
+  -- the first 60 folders had no transcript), so say what happened instead of
+  -- running the whole pipeline on a header-only WAV. The folder is kept; the
+  -- note in it keeps it out of the "never transcribed" count.
+  local ranFor = meetingStoppedAt - meetingStartedAt
+  if ranFor < MEETING_MIN_SECONDS then
+    local f = io.open(dir .. "/too-short.txt", "w")
+    if f then
+      f:write(string.format("Stopped after %.1f s. Nothing worth transcribing was recorded, " ..
+                            "so the transcript step was skipped.\n", ranFor))
+      f:close()
+    end
+    pcall(refreshMenubar)
+    hs.alert.show(string.format("Meeting stopped after %.1f s - nothing recorded", ranFor), 3)
+    return
+  end
+
   pcall(showTranscribingIndicator)
   pcall(refreshMenubar)
   hs.alert.show("Meeting ended - transcribing...", 2)
@@ -941,27 +979,49 @@ if TELEMETRY_ENABLED then
 end
 
 -- ─── fn-key event tap ────────────────────────────────────────────────────────
+-- Only a real fn DOWN-edge counts as a press. Before 0.6.3 any flagsChanged
+-- event whose flags included fn counted - including the Cmd-down and Cmd-up of
+-- our own paste while fn was still held for the next take. On 2026-09-28 the
+-- Cmd-down landed 0.36 s after the fn press, read as a double-tap and started a
+-- meeting; the Cmd-up stopped it 90 ms later. So: ignore flagsChanged from the
+-- other modifier keys outright, and act only when the fn flag actually changes.
+local OTHER_MODIFIER_KEYCODES = {
+  [54] = true, [55] = true,   -- right / left command
+  [56] = true, [60] = true,   -- left / right shift
+  [57] = true,                -- caps lock
+  [58] = true, [61] = true,   -- left / right option
+  [59] = true, [62] = true,   -- left / right control
+}
+local fnIsDown = hs.eventtap.checkKeyboardModifiers().fn and true or false
+
 local fnTap
-fnTap = hs.eventtap.new({
-  hs.eventtap.event.types.flagsChanged,
-  hs.eventtap.event.types.tapDisabledByTimeout,
-  hs.eventtap.event.types.tapDisabledByUserInput,
-}, function(event)
+local function onFlagsChanged(event)
   local etype = event:getType()
   if etype == hs.eventtap.event.types.tapDisabledByTimeout
      or etype == hs.eventtap.event.types.tapDisabledByUserInput then
+    -- We may have missed edges while disabled; take the real state.
+    fnIsDown = hs.eventtap.checkKeyboardModifiers().fn and true or false
     fnTap:start()
     return false
   end
 
-  if not event:getFlags().fn then return false end
+  if OTHER_MODIFIER_KEYCODES[event:getKeyCode()] then return false end
+  local down = event:getFlags().fn and true or false
+  if down == fnIsDown then return false end   -- fn did not change
+  fnIsDown = down
+  if not down then return false end            -- a release; the hold watchdog handles it
 
   local now = hs.timer.secondsSinceEpoch()
   local sinceLast = now - lastFnDownTime
   lastFnDownTime = now
 
-  -- Meeting in progress → any fn press stops it.
+  -- Meeting in progress → any fn press stops it, except in the first second,
+  -- where a stray or bounced tap would end the meeting before it began.
   if meetingActive then
+    if now - meetingStartedAt < MEETING_STOP_GRACE then
+      hs.alert.show("Meeting just started - tap fn again to stop it", 1.5)
+      return false
+    end
     stopMeeting()
     return false
   end
@@ -1005,7 +1065,12 @@ fnTap = hs.eventtap.new({
     startRec(false)
   end
   return false
-end)
+end
+fnTap = hs.eventtap.new({
+  hs.eventtap.event.types.flagsChanged,
+  hs.eventtap.event.types.tapDisabledByTimeout,
+  hs.eventtap.event.types.tapDisabledByUserInput,
+}, onFlagsChanged)
 fnTap:start()
 
 -- ─── Menubar setup (must come AFTER refreshMenubar definition) ───────────────
@@ -1105,6 +1170,9 @@ hs.timer.doEvery(24 * 3600, checkForUpdate)
 --   hs -c "utDebug.stop()"             end a meeting that will not end
 --   hs -c "utDebug.status()"           what this install is and what it is doing
 --   hs -c "utDebug.start()"            start a meeting without touching the keyboard
+--   hs -c "utDebug.feed(55, {fn=true, cmd=true})"
+--                                      hand the fn tap one flagsChanged event
+--                                      directly, without posting it to macOS
 --
 -- scripts/selftest-meeting.sh drives the whole stop path through these.
 utDebug = {
@@ -1113,9 +1181,16 @@ utDebug = {
   stop     = function() stopMeeting() end,
   status   = function()
     return string.format(
-      "version=%s meeting_available=%s meeting_active=%s recording=%s dir=%s",
+      "version=%s meeting_available=%s meeting_active=%s recording=%s fn_down=%s dir=%s",
       VERSION, tostring(MEETING_AVAILABLE), tostring(meetingActive),
-      tostring(recording), tostring(meetingDir))
+      tostring(recording), tostring(fnIsDown), tostring(meetingDir))
+  end,
+  feed     = function(keycode, flags)
+    local e = hs.eventtap.event.newEvent()
+    e:setType(hs.eventtap.event.types.flagsChanged)
+    e:setKeyCode(keycode)
+    e:setFlags(flags or {})
+    return onFlagsChanged(e)
   end,
   meetingActive = function() return meetingActive end,
   -- Same text the menubar's "Copy diagnostics" produces, so it can be checked

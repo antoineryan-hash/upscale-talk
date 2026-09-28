@@ -12,8 +12,15 @@
 #                   still transcribing, for the 18-29 minutes that takes
 #   cap             a capture must stop itself when Hammerspoon dies, because
 #                   nothing in Lua can (36 minute run-on, Marc, 3 Sep)
+#   phantom         a paste made while fn was held started AND stopped a
+#                   meeting 90 ms apart (28 Sep)
+#   quick-stop      that 90 ms meeting then froze Hammerspoon until it was
+#                   force quit: a capture child held hs.task's pipes (28 Sep)
 #
-# Needs meeting mode installed and Hammerspoon running the v0.6.2 config.
+# --quick runs only the phantom and quick-stop checks (no 10 s meeting, no
+# transcript pipeline). --cap adds the cap test.
+#
+# Needs meeting mode installed and Hammerspoon running the v0.6.3 config.
 set -uo pipefail
 DEST="$HOME/upscale-talk"
 MEET="$DEST/meetings"
@@ -44,7 +51,104 @@ if ! hs_run "utDebug.version" >/dev/null; then
   echo "utDebug is not exposed. Reload Hammerspoon on v0.6.2 or later."; exit 2
 fi
 
+QUICK=0; CAP=0
+for a in "$@"; do
+  case "$a" in --quick) QUICK=1 ;; --cap) CAP=1 ;; esac
+done
+
+finish() {
+  if [ -n "${QDIR:-}" ] && hs_run "utDebug.status()" | grep -q "meeting_active=true"; then
+    hs_run "utDebug.stop()" >/dev/null; note "stopped the test meeting that was still recording"
+  fi
+  echo
+  echo "  $PASS passed, $FAIL failed"
+  [ -n "${QDIR:-}" ] && echo "  quick-stop test meeting left at $QDIR - delete it when you are done"
+  [ -n "${DIR:-}" ] && echo "  test meeting left at $DIR - delete it when you are done"
+  exit $([ "$FAIL" -eq 0 ] && echo 0 || echo 1)
+}
+
 echo "upscale-talk meeting self-test  (config $(hs_run "utDebug.version" | tr -d '\r'))"
+echo
+
+# utDebug.feed drives the LIVE fn tap. If a dictation is running, or fn is held,
+# a fed tap lands in the middle of it and can abandon someone's take (it did,
+# while this test was being written). So refuse rather than interfere.
+busy() {
+  hs_run "utDebug.status()" | grep -q "recording=true\|meeting_active=true\|fn_down=true" && return 0
+  hs_run "hs.eventtap.checkKeyboardModifiers().fn" | grep -q true
+}
+if busy; then
+  echo "  upscale-talk is in use (dictating, recording, or fn held)."
+  echo "  Run this again when you are not using it."
+  exit 2
+fi
+
+# ─── 0a. phantom taps: only a real fn down-edge counts ───────────────────────
+# Hands the fn tap the flagsChanged events our own paste makes (Cmd, with fn
+# set) straight through utDebug.feed: nothing is posted to macOS, nothing typed.
+if ! hs_run "utDebug.feed ~= nil" | grep -q true; then
+  bad "utDebug.feed missing - reload Hammerspoon on v0.6.3 or later"
+else
+  hs_run "utDebug.feed(55, {fn=true, cmd=true})" >/dev/null; sleep 0.1
+  hs_run "utDebug.feed(55, {fn=true})" >/dev/null; sleep 0.3
+  ST="$(hs_run "utDebug.status()")"
+  if echo "$ST" | grep -q "meeting_active=false" && echo "$ST" | grep -q "recording=false"; then
+    ok "a paste's Cmd events (with fn set) start nothing"
+  else
+    bad "Cmd events with fn set started something: $ST"
+    hs_run "utDebug.stop()" >/dev/null
+  fi
+
+  # ─── 0b. quick stop: a real double-tap, a bounced tap, a stop at 1.5 s ─────
+  # The whole sequence runs on Hammerspoon's own timers in ONE call: hs -c round
+  # trips cannot stretch it past the 2 s short-meeting line, and the first tap's
+  # dictation is abandoned inside the double-tap before it can be transcribed or
+  # pasted anywhere.
+  if ! hs_run "utDebug.status()" | grep -q "meeting_available=true"; then
+    note "meeting mode is not installed here - quick-stop checks skipped"
+  else
+  if busy; then echo "  upscale-talk came into use mid-test - stopping here"; finish; fi
+  QDIR="$(hs_run "utDebug.feed(63,{fn=true}); utDebug.feed(63,{}); utDebug.feed(63,{fn=true}); utDebug.feed(63,{}); \
+    UT_SELFTEST = {dir = utDebug.status():match('dir=(%S+)')}; \
+    UT_SELFTEST.t1 = hs.timer.doAfter(0.5, function() utDebug.feed(63,{fn=true}); utDebug.feed(63,{}); \
+      UT_SELFTEST.grace = utDebug.meetingActive() end); \
+    UT_SELFTEST.t2 = hs.timer.doAfter(1.5, function() utDebug.feed(63,{fn=true}); utDebug.feed(63,{}); \
+      UT_SELFTEST.stopped = not utDebug.meetingActive() end); \
+    return UT_SELFTEST.dir" | tail -1 | tr -d '\r')"
+  if [ -n "$QDIR" ] && [ "$QDIR" != "nil" ] && [ -d "$QDIR" ]; then
+    ok "a real fn double-tap still starts a meeting"
+  else
+    bad "a real fn double-tap did not start a meeting"; QDIR=""
+  fi
+  sleep 4.5
+  # The 28 Sep freeze: ask Hammerspoon something, with a deadline.
+  if python3 -c "import subprocess; subprocess.run(['$HS','-c','1+1'], stdin=subprocess.DEVNULL, capture_output=True, timeout=2)" 2>/dev/null; then
+    ok "Hammerspoon answers 3 s after a quick stop"
+  else
+    bad "Hammerspoon did NOT answer 3 s after a quick stop - the 28 Sep freeze"
+  fi
+  hs_run "UT_SELFTEST.grace" | grep -q true \
+    && ok "a tap 0.5 s in is ignored (stop grace)" || bad "a tap 0.5 s in ended the meeting"
+  hs_run "UT_SELFTEST.stopped" | grep -q true \
+    && ok "a tap 1.5 s in stopped it" || bad "a tap 1.5 s in did not stop the meeting"
+  if [ -n "$QDIR" ] && [ -f "$QDIR/too-short.txt" ] && [ ! -d "$QDIR/me_diar" ]; then
+    ok "under 2 s: noted in too-short.txt, transcript step skipped"
+  else
+    bad "the short meeting was not skipped (${QDIR:-no folder})"
+  fi
+  if [ -n "$QDIR" ] && pgrep -f "capture-(mic|system).sh $QDIR" >/dev/null; then
+    bad "capture wrappers still running for $QDIR"
+  else
+    ok "no capture processes left behind"
+  fi
+  if ls "${TMPDIR:-/tmp}"/*.pcm >/dev/null 2>&1; then
+    bad "leftover fifo(s): $(ls "${TMPDIR:-/tmp}"/*.pcm | tr '\n' ' ')"
+  else
+    ok "no fifos left behind"
+  fi
+  fi
+fi
+[ "$QUICK" = 1 ] && finish
 echo
 
 # ─── 1. start ────────────────────────────────────────────────────────────────
@@ -128,7 +232,7 @@ fi
 rm -f "$PROBEWAV"
 
 # ─── 5. the cap, without waiting 3 hours ─────────────────────────────────────
-if [ "${1:-}" = "--cap" ]; then
+if [ "$CAP" = 1 ]; then
   echo
   echo "  cap test: 20s capture, heartbeat abandoned after 5s"
   HB="$(mktemp)"; OUT="$(mktemp -d)/cap.wav"
@@ -155,7 +259,4 @@ if [ "${1:-}" = "--cap" ]; then
   rm -f "$HB" "$OUT"
 fi
 
-echo
-echo "  $PASS passed, $FAIL failed"
-[ -n "${DIR:-}" ] && echo "  test meeting left at $DIR - delete it when you are done"
-exit $([ "$FAIL" -eq 0 ] && echo 0 || echo 1)
+finish

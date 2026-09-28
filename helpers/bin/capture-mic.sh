@@ -36,6 +36,54 @@ MIC_LOG="${OUT%.wav}.mic.log"
 FFMPEG="/opt/homebrew/bin/ffmpeg"
 [ -x "$FFMPEG" ] || FFMPEG="$(command -v ffmpeg)"
 
+# ─── let go of Hammerspoon's pipes before anything else ──────────────────────
+# Same reason as capture-system.sh: Hammerspoon reads this script's stdout and
+# stderr to EOF on its MAIN THREAD when it exits, so any child still holding
+# them (a stuck writer, the guard's `sleep 15`) freezes the whole app. That is
+# what happened on 2026-09-28. Nothing started below can hold them now.
+exec </dev/null >>"${OUT%.wav}.wrapper.log" 2>&1
+log() { printf '%s capture-mic: %s\n' "$(date '+%H:%M:%S')" "$*"; }
+
+# Installed before any child exists, so a stop in the first milliseconds still
+# cleans up instead of killing the script mid-launch.
+FF_PID=""; MIC_PID=""; GUARD_PID=""; FIFO=""; STOPPING=0
+
+# Wait up to $2 tenths of a second for pid $1 to exit. Returns 1 if still alive.
+wait_gone() {
+  local n=0
+  while kill -0 "$1" 2>/dev/null; do
+    [ "$n" -ge "$2" ] && return 1
+    sleep 0.1; n=$((n + 1))
+  done
+  return 0
+}
+
+cleanup() {
+  [ "$STOPPING" = 1 ] && return
+  STOPPING=1
+  if [ -n "$GUARD_PID" ]; then
+    pkill -TERM -P "$GUARD_PID" 2>/dev/null   # its sleep
+    kill -TERM "$GUARD_PID" 2>/dev/null
+  fi
+  if [ -n "$MIC_PID" ]; then
+    kill -TERM "$MIC_PID" 2>/dev/null                          # polite first, in case it is between reads
+    wait_gone "$MIC_PID" 3 || kill -9 "$MIC_PID" 2>/dev/null   # it ignores SIGTERM on avfoundation
+  fi
+  if [ -n "$FF_PID" ]; then
+    # Let the writer finalise a valid WAV, but never wait forever. Everything
+    # here must finish inside init.lua's 2 s escalation.
+    if ! wait_gone "$FF_PID" 8; then
+      log "writer still waiting 0.8 s after the capture stopped - killed it; me.wav may be incomplete"
+      kill -9 "$FF_PID" 2>/dev/null
+    fi
+    wait "$FF_PID" 2>/dev/null
+  fi
+  pkill -9 -P $$ 2>/dev/null   # a child started just as the stop landed, before its $! was saved
+  [ -n "$FIFO" ] && rm -f "$FIFO"
+  exit 0
+}
+trap cleanup TERM INT
+
 FIFO="$(mktemp -u).pcm"
 mkfifo "$FIFO"
 
@@ -69,26 +117,15 @@ FF_PID=$!
 BACKEND="${UT_MIC_BACKEND:-ffmpeg}"
 if [ "$BACKEND" = "sox" ] && command -v rec >/dev/null 2>&1; then
   if [ "$MAXSEC" -gt 0 ] 2>/dev/null; then TRIM=(trim 0 "$MAXSEC"); else TRIM=(); fi
-  rec -q -c 2 -r 16000 -b 16 -t raw -e signed-integer - "${TRIM[@]}" \
+  rec -q -c 2 -r 16000 -b 16 -t raw -e signed-integer - ${TRIM[@]+"${TRIM[@]}"} \
       > "$FIFO" 2>"$MIC_LOG" &
 else
   TARGS=()
   [ "$MAXSEC" -gt 0 ] 2>/dev/null && TARGS=(-t "$MAXSEC")
   "$FFMPEG" -loglevel error -f avfoundation -i ":$DEV" -ar 16000 -ac 2 \
-            "${TARGS[@]}" -f s16le - > "$FIFO" 2>"$MIC_LOG" &
+            ${TARGS[@]+"${TARGS[@]}"} -f s16le - > "$FIFO" 2>"$MIC_LOG" &
 fi
 MIC_PID=$!
-
-cleanup() {
-  [ -n "${GUARD_PID:-}" ] && kill -TERM "$GUARD_PID" 2>/dev/null
-  kill -TERM "$MIC_PID" 2>/dev/null   # polite first, in case it is between reads
-  sleep 0.3
-  kill -9 "$MIC_PID" 2>/dev/null      # it ignores SIGTERM on avfoundation
-  wait "$FF_PID" 2>/dev/null          # let the writer finalise a valid WAV
-  rm -f "$FIFO"
-  exit 0
-}
-trap cleanup TERM INT
 
 # ─── guard: stop ourselves if Hammerspoon stops telling us it is alive ────────
 # Only enforced when the heartbeat file actually exists, so an older init.lua

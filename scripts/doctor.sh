@@ -98,7 +98,8 @@ for name in sorted(os.listdir(root)):
     # is unambiguous evidence the mic kept recording after the stop.
     if m and t and m > t * 1.1 + 60:
         runons.append((name, m, t))
-    if (m or t) and not os.path.exists(os.path.join(d, "transcript.txt")):
+    if (m or t) and not os.path.exists(os.path.join(d, "transcript.txt")) \
+            and not os.path.exists(os.path.join(d, "too-short.txt")):
         unfinished += 1
         bytes_unfinished += sum(os.path.getsize(os.path.join(d, f))
                                 for f in os.listdir(d)
